@@ -13,6 +13,11 @@ extern crate tokio_uds;
 
 mod subprocess;
 
+use subprocess::Subprocess;
+use tokio_core::reactor::Core;
+
 fn main() {
-    subprocess::fork_and_communicate();
+    let mut core = Core::new().unwrap();
+    let handle = core.handle();
+    core.run(Subprocess::new(&handle).backdoor()).unwrap().wait_close();
 }
