@@ -19,5 +19,6 @@ use tokio_core::reactor::Core;
 fn main() {
     let mut core = Core::new().unwrap();
     let handle = core.handle();
-    core.run(Subprocess::new(&handle).backdoor()).unwrap().wait_close();
+    core.run(Subprocess::new(&handle).unwrap().backdoor())
+        .unwrap().wait_close().unwrap();
 }

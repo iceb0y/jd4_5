@@ -1,13 +1,16 @@
 // TODO(iceboy): distinguish traits and other names?
+use std::convert;
 use std::io::{self, Read};
 use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::process::{self, Command};
+use std::result;
 use bincode;
 use byteorder::{BigEndian, ReadBytesExt};
 use futures::{future, Future};
 use futures::Stream;
 use futures::sink::Sink;
+use nix;
 use nix::unistd;
 use nix::sys::socket;
 use nix::sys::wait;
@@ -26,17 +29,30 @@ pub struct Subprocess {
     child: unistd::Pid,
 }
 
+#[derive(Debug)]
+pub struct Error;
+
+impl convert::From<io::Error> for Error {
+    fn from(_: io::Error) -> Self { Error }
+}
+
+impl convert::From<nix::Error> for Error {
+    fn from(_: nix::Error) -> Self { Error }
+}
+
+pub type Result<T> = result::Result<T, Error>;
+
 impl Subprocess {
     // TODO(iceboy): close existing fds
-    pub fn new(handle: &Handle) -> Subprocess {
+    pub fn new(handle: &Handle) -> Result<Subprocess> {
         let (parent_fd, child_fd) = socket::socketpair(
             socket::AddressFamily::Unix,
             socket::SockType::Stream,
             0,
-            socket::SockFlag::empty()).unwrap();
-        let child = match unistd::fork().unwrap() {
+            socket::SockFlag::empty())?;
+        let child = match unistd::fork()? {
             unistd::ForkResult::Parent { child } => {
-                unistd::close(child_fd).unwrap();
+                unistd::close(child_fd)?;
                 child
             },
             unistd::ForkResult::Child => {
@@ -45,15 +61,14 @@ impl Subprocess {
             },
         };
         let stream = unsafe { UnixStream::from_raw_fd(parent_fd) };
-        let async_stream =
-            tokio_uds::UnixStream::from_stream(stream, handle).unwrap();
+        let async_stream = tokio_uds::UnixStream::from_stream(stream, handle)?;
         let framed = length_delimited::Framed::new(async_stream);
         let (sink, source) = framed.split();
         drop(source);
-        Subprocess {
+        Ok(Subprocess {
             sink: Box::new(WriteBincode::new(sink)),
             child: child,
-        }
+        })
     }
 
     // TODO(iceboy): replace with impl trait
@@ -66,9 +81,10 @@ impl Subprocess {
             })))
     }
 
-    pub fn wait_close(self) {
+    pub fn wait_close(self) -> Result<()> {
         drop(self.sink);
-        wait::waitpid(self.child, Option::None).unwrap();
+        wait::waitpid(self.child, Option::None)?;
+        Ok(())
     }
 }
 
