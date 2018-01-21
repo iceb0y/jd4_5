@@ -17,7 +17,6 @@ use tokio_uds;
 
 pub struct Subprocess {
     stream: tokio_uds::UnixStream,
-    child: unistd::Pid,
 }
 
 #[derive(Debug)]
@@ -45,6 +44,9 @@ enum Response {
     Close,
 }
 
+const LENGTH_FIELD_LENGTH: usize = 2;
+const MAX_FRAME_LENGTH: usize = 4096;
+
 impl Subprocess {
     // TODO(iceboy): close existing fds
     pub fn new(handle: &Handle) -> Result<Subprocess> {
@@ -53,10 +55,9 @@ impl Subprocess {
             socket::SockType::Stream,
             0,
             socket::SockFlag::empty())?;
-        let child = match unistd::fork()? {
-            unistd::ForkResult::Parent { child } => {
+        match unistd::fork()? {
+            unistd::ForkResult::Parent { .. } => {
                 unistd::close(child_fd)?;
-                child
             },
             unistd::ForkResult::Child => {
                 unistd::close(parent_fd).unwrap();
@@ -66,37 +67,43 @@ impl Subprocess {
         let stream = tokio_uds::UnixStream::from_stream(
             unsafe { UnixStream::from_raw_fd(parent_fd) },
             handle)?;
-        Ok(Subprocess { stream: stream, child: child })
+        Ok(Subprocess { stream: stream })
     }
 
     fn call(self, request: Request)
         -> impl Future<Item = (Response, Subprocess), Error = io::Error> {
-        let Subprocess { stream, child } = self;
+        let Subprocess { stream } = self;
         let framed = length_delimited::Builder::new()
             .little_endian()
-            .length_field_length(2)
+            .length_field_length(LENGTH_FIELD_LENGTH)
+            .max_frame_length(MAX_FRAME_LENGTH)
             .new_framed(stream);
         let (sink, source) = framed.split();
         let rsink = WriteBincode::new(sink);
         rsink.send(request)
             .and_then(move |rsink| {
                 let rsource = ReadBincode::new(source);
-                (Ok(rsink), rsource.into_future().map_err(|_| {
-                    // TODO(iceboy): ???
-                    io::Error::new(io::ErrorKind::Other, "???")
-                }))
+                (
+                    Ok(rsink),
+                    rsource.into_future().map_err(|(err, _)| {
+                        io::Error::new(io::ErrorKind::InvalidData, err)
+                    }),
+                )
             })
             .and_then(move |(rsink, (maybe_response, rsource))| {
-                let response = match maybe_response {
-                    Some(response) => response,
-                    // TODO(iceboy): ???
-                    None => panic!("???"),
-                };
-                let source = rsource.into_inner();
-                let sink = rsink.into_inner();
-                let framed = source.reunite(sink).unwrap();
-                let stream = framed.into_inner();
-                Ok((response, Subprocess { stream: stream, child: child }))
+                match maybe_response {
+                    Some(response) => {
+                        let source = rsource.into_inner();
+                        let sink = rsink.into_inner();
+                        let framed = source.reunite(sink).unwrap();
+                        let stream = framed.into_inner();
+                        Ok((response, Subprocess { stream: stream }))
+                    },
+                    None => {
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData, "empty response"))
+                    },
+                }
             })
     }
 
@@ -120,6 +127,7 @@ impl Subprocess {
 fn handle_child(mut stream: UnixStream) -> ! {
     let mut closed = false;
     let mut buffer = Vec::new();
+    buffer.reserve_exact(MAX_FRAME_LENGTH);
     while !closed {
         let size = stream.read_u16::<LittleEndian>().unwrap() as usize;
         buffer.resize(size, 0);
@@ -133,7 +141,8 @@ fn handle_child(mut stream: UnixStream) -> ! {
             }
         };
         buffer.resize(0, 0);
-        bincode::serialize_into(&mut buffer, &response, Bounded(65536)).unwrap();
+        bincode::serialize_into(
+            &mut buffer, &response, Bounded(MAX_FRAME_LENGTH as u64)).unwrap();
         stream.write_u16::<LittleEndian>(buffer.len() as u16).unwrap();
         stream.write_all(&buffer).unwrap();
     }
