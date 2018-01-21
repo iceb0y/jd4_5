@@ -12,5 +12,5 @@ serde = "1.0.24"
 serde_derive = "1.0.24"
 tokio-core = "0.1.10"
 tokio-io = "0.1.4"
-tokio-serde-bincode = "0.1.1"
+tokio-serde-bincode = { git = "https://github.com/alexcrichton/tokio-serde-bincode.git" }
 tokio-uds = "0.1.7"

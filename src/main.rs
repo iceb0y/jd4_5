@@ -1,3 +1,5 @@
+#![feature(conservative_impl_trait)]
+
 #[macro_use]
 extern crate serde_derive;
 
@@ -13,12 +15,17 @@ extern crate tokio_uds;
 
 mod subprocess;
 
+use futures::Future;
 use subprocess::Subprocess;
 use tokio_core::reactor::Core;
 
 fn main() {
     let mut core = Core::new().unwrap();
     let handle = core.handle();
-    core.run(Subprocess::new(&handle).unwrap().backdoor())
-        .unwrap().wait_close().unwrap();
+    let subprocess = Subprocess::new(&handle).unwrap();
+    core.run(
+        subprocess.backdoor()
+            .and_then(|subprocess| {
+                subprocess.close()
+            })).unwrap();
 }
