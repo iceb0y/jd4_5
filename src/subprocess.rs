@@ -2,14 +2,13 @@ use std::io::{self, Read};
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::net;
 use std::process::{self, Command};
-use std::result;
 use bincode::{self, Infinite};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use futures::{Future, Stream};
 use futures::sink::Sink;
-use nix;
 use nix::unistd;
 use nix::sys::socket;
+use sandbox;
 use serde::{Serialize, Deserialize};
 use tokio_core::reactor::Handle;
 use tokio_io::codec::length_delimited::{self, Framed};
@@ -17,19 +16,6 @@ use tokio_serde_bincode::{ReadBincode, WriteBincode};
 use tokio_uds;
 
 pub struct Subprocess(Framed<tokio_uds::UnixStream>);
-
-#[derive(Debug)]
-pub struct Error;
-
-impl From<io::Error> for Error {
-    fn from(_: io::Error) -> Self { Error }
-}
-
-impl From<nix::Error> for Error {
-    fn from(_: nix::Error) -> Self { Error }
-}
-
-pub type Result<T> = result::Result<T, Error>;
 
 #[derive(Serialize, Deserialize)]
 enum Request {
@@ -50,15 +36,15 @@ const MAX_FRAME_LENGTH: usize = 4096;
 
 impl Subprocess {
     // TODO(iceboy): close existing fds
-    pub fn new(handle: &Handle) -> Result<Subprocess> {
+    pub fn new(handle: &Handle) -> Subprocess {
         let (parent_fd, child_fd) = socket::socketpair(
             socket::AddressFamily::Unix,
             socket::SockType::Stream,
             0,
-            socket::SockFlag::empty())?;
-        match unistd::fork()? {
+            socket::SockFlag::empty()).unwrap();
+        match unistd::fork().unwrap() {
             unistd::ForkResult::Parent { .. } => {
-                unistd::close(child_fd)?;
+                unistd::close(child_fd).unwrap();
             },
             unistd::ForkResult::Child => {
                 unistd::close(parent_fd).unwrap();
@@ -66,13 +52,23 @@ impl Subprocess {
             },
         };
         let net_stream = unsafe { net::UnixStream::from_raw_fd(parent_fd) };
-        let async_stream = tokio_uds::UnixStream::from_stream(net_stream, handle)?;
+        let async_stream = tokio_uds::UnixStream::from_stream(
+            net_stream, handle).unwrap();
         let framed_stream = length_delimited::Builder::new()
             .little_endian()
             .length_field_length(LENGTH_FIELD_LENGTH)
             .max_frame_length(MAX_FRAME_LENGTH)
             .new_framed(async_stream);
-        Ok(Subprocess(framed_stream))
+        Subprocess(framed_stream)
+    }
+
+    pub fn backdoor(self)
+        -> impl Future<Item = (BackdoorResult, Subprocess), Error = io::Error> {
+        self.call::<BackdoorResult>(Request::Backdoor)
+    }
+
+    pub fn close(self) -> impl Future<Item = (), Error = io::Error> {
+        self.call::<()>(Request::Close).map(|_| ())
     }
 
     fn call<ResponseT: for<'a> Deserialize<'a>>(self, request: Request)
@@ -96,18 +92,10 @@ impl Subprocess {
                 }
             })
     }
-
-    pub fn backdoor(self)
-        -> impl Future<Item = (BackdoorResult, Subprocess), Error = io::Error> {
-        self.call::<BackdoorResult>(Request::Backdoor)
-    }
-
-    pub fn close(self) -> impl Future<Item = (), Error = io::Error> {
-        self.call::<()>(Request::Close).map(|_| ())
-    }
 }
 
 fn do_child(child_fd: RawFd) -> ! {
+    sandbox::init();
     let mut stream = unsafe { net::UnixStream::from_raw_fd(child_fd) };
     let mut buffer = [0; MAX_FRAME_LENGTH];
     loop {
@@ -119,14 +107,6 @@ fn do_child(child_fd: RawFd) -> ! {
             Request::Close => do_close(&mut stream),
         };
     }
-}
-
-fn write_response<ResponseT: Serialize>(
-    stream: &mut net::UnixStream, response: &ResponseT) {
-    let size = bincode::serialized_size(response) as usize;
-    assert!(size <= MAX_FRAME_LENGTH);
-    stream.write_u16::<LittleEndian>(size as u16).unwrap();
-    bincode::serialize_into(stream, response, Infinite).unwrap();
 }
 
 fn do_backdoor(stream: &mut net::UnixStream) {
@@ -146,4 +126,12 @@ fn do_backdoor(stream: &mut net::UnixStream) {
 fn do_close(stream: &mut net::UnixStream) -> ! {
     write_response(stream, &());
     process::exit(0)
+}
+
+fn write_response<ResponseT: Serialize>(
+    stream: &mut net::UnixStream, response: &ResponseT) {
+    let size = bincode::serialized_size(response) as usize;
+    assert!(size <= MAX_FRAME_LENGTH);
+    stream.write_u16::<LittleEndian>(size as u16).unwrap();
+    bincode::serialize_into(stream, response, Infinite).unwrap();
 }
