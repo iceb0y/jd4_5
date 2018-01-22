@@ -1,23 +1,22 @@
-use std::io::{self, Read, Write};
-use std::os::unix::io::FromRawFd;
-use std::os::unix::net::UnixStream;
+use std::io::{self, Read};
+use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::net;
 use std::process::{self, Command};
 use std::result;
-use bincode::{self, Bounded};
+use bincode::{self, Infinite};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use futures::{Future, Stream};
 use futures::sink::Sink;
 use nix;
 use nix::unistd;
 use nix::sys::socket;
+use serde::{Serialize, Deserialize};
 use tokio_core::reactor::Handle;
-use tokio_io::codec::length_delimited;
+use tokio_io::codec::length_delimited::{self, Framed};
 use tokio_serde_bincode::{ReadBincode, WriteBincode};
 use tokio_uds;
 
-pub struct Subprocess {
-    stream: tokio_uds::UnixStream,
-}
+pub struct Subprocess(Framed<tokio_uds::UnixStream>);
 
 #[derive(Debug)]
 pub struct Error;
@@ -32,16 +31,18 @@ impl From<nix::Error> for Error {
 
 pub type Result<T> = result::Result<T, Error>;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize)]
 enum Request {
     Backdoor,
     Close,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-enum Response {
-    Backdoor,
-    Close,
+pub enum BackdoorResult {
+    Exited(i32),
+    Signaled,
+    SpawnError,
+    WaitError,
 }
 
 const LENGTH_FIELD_LENGTH: usize = 2;
@@ -61,43 +62,32 @@ impl Subprocess {
             },
             unistd::ForkResult::Child => {
                 unistd::close(parent_fd).unwrap();
-                handle_child(unsafe { UnixStream::from_raw_fd(child_fd) });
+                do_child(child_fd);
             },
         };
-        let stream = tokio_uds::UnixStream::from_stream(
-            unsafe { UnixStream::from_raw_fd(parent_fd) },
-            handle)?;
-        Ok(Subprocess { stream: stream })
-    }
-
-    fn call(self, request: Request)
-        -> impl Future<Item = (Response, Subprocess), Error = io::Error> {
-        let Subprocess { stream } = self;
-        let framed = length_delimited::Builder::new()
+        let net_stream = unsafe { net::UnixStream::from_raw_fd(parent_fd) };
+        let async_stream = tokio_uds::UnixStream::from_stream(net_stream, handle)?;
+        let framed_stream = length_delimited::Builder::new()
             .little_endian()
             .length_field_length(LENGTH_FIELD_LENGTH)
             .max_frame_length(MAX_FRAME_LENGTH)
-            .new_framed(stream);
-        let (sink, source) = framed.split();
-        let rsink = WriteBincode::new(sink);
-        rsink.send(request)
-            .and_then(move |rsink| {
-                let rsource = ReadBincode::new(source);
-                (
-                    Ok(rsink),
-                    rsource.into_future().map_err(|(err, _)| {
+            .new_framed(async_stream);
+        Ok(Subprocess(framed_stream))
+    }
+
+    fn call<ResponseT: for<'a> Deserialize<'a>>(self, request: Request)
+        -> impl Future<Item = (ResponseT, Subprocess), Error = io::Error> {
+        WriteBincode::new(self.0).send(request)
+            .and_then(|sink| {
+                ReadBincode::new(sink.into_inner()).into_future()
+                    .map_err(|(err, _)| {
                         io::Error::new(io::ErrorKind::InvalidData, err)
-                    }),
-                )
+                    })
             })
-            .and_then(move |(rsink, (maybe_response, rsource))| {
+            .and_then(|(maybe_response, source)| {
                 match maybe_response {
                     Some(response) => {
-                        let source = rsource.into_inner();
-                        let sink = rsink.into_inner();
-                        let framed = source.reunite(sink).unwrap();
-                        let stream = framed.into_inner();
-                        Ok((response, Subprocess { stream: stream }))
+                        Ok((response, Subprocess(source.into_inner())))
                     },
                     None => {
                         Err(io::Error::new(
@@ -107,50 +97,53 @@ impl Subprocess {
             })
     }
 
-    pub fn backdoor(self) -> impl Future<Item = Subprocess, Error = io::Error> {
-        self.call(Request::Backdoor)
-            .and_then(|(_, subprocess)| {
-                // TODO(iceboy): Check response.
-                Ok(subprocess)
-            })
+    pub fn backdoor(self)
+        -> impl Future<Item = (BackdoorResult, Subprocess), Error = io::Error> {
+        self.call::<BackdoorResult>(Request::Backdoor)
     }
 
     pub fn close(self) -> impl Future<Item = (), Error = io::Error> {
-        self.call(Request::Close)
-            .and_then(|(_, _)| {
-                // TODO(iceboy): Check response.
-                Ok(())
-            })
+        self.call::<()>(Request::Close).map(|_| ())
     }
 }
 
-fn handle_child(mut stream: UnixStream) -> ! {
-    let mut closed = false;
-    let mut buffer = Vec::new();
-    buffer.reserve_exact(MAX_FRAME_LENGTH);
-    while !closed {
+fn do_child(child_fd: RawFd) -> ! {
+    let mut stream = unsafe { net::UnixStream::from_raw_fd(child_fd) };
+    let mut buffer = [0; MAX_FRAME_LENGTH];
+    loop {
         let size = stream.read_u16::<LittleEndian>().unwrap() as usize;
-        buffer.resize(size, 0);
-        stream.read_exact(&mut buffer).unwrap();
-        let request = bincode::deserialize(&buffer).unwrap();
-        let response = match request {
-            Request::Backdoor => handle_backdoor(),
-            Request::Close => {
-                closed = true;
-                Response::Close
-            }
+        assert!(size <= MAX_FRAME_LENGTH);
+        stream.read_exact(&mut buffer[..size]).unwrap();
+        match bincode::deserialize(&buffer[..size]).unwrap() {
+            Request::Backdoor => do_backdoor(&mut stream),
+            Request::Close => do_close(&mut stream),
         };
-        buffer.resize(0, 0);
-        bincode::serialize_into(
-            &mut buffer, &response, Bounded(MAX_FRAME_LENGTH as u64)).unwrap();
-        stream.write_u16::<LittleEndian>(buffer.len() as u16).unwrap();
-        stream.write_all(&buffer).unwrap();
     }
-    process::exit(0)
 }
 
-fn handle_backdoor() -> Response {
-    // TODO(iceboy): Send back errors.
-    Command::new("bash").spawn().unwrap().wait().unwrap();
-    Response::Backdoor
+fn write_response<ResponseT: Serialize>(
+    stream: &mut net::UnixStream, response: &ResponseT) {
+    let size = bincode::serialized_size(response) as usize;
+    assert!(size <= MAX_FRAME_LENGTH);
+    stream.write_u16::<LittleEndian>(size as u16).unwrap();
+    bincode::serialize_into(stream, response, Infinite).unwrap();
+}
+
+fn do_backdoor(stream: &mut net::UnixStream) {
+    let response = match Command::new("bash").spawn() {
+        Ok(mut child) => match child.wait() {
+            Ok(status) => match status.code() {
+                Some(code) => BackdoorResult::Exited(code),
+                None => BackdoorResult::Signaled,
+            },
+            Err(_) => BackdoorResult::WaitError,
+        },
+        Err(_) => BackdoorResult::SpawnError,
+    };
+    write_response(stream, &response);
+}
+
+fn do_close(stream: &mut net::UnixStream) -> ! {
+    write_response(stream, &());
+    process::exit(0)
 }

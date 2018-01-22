@@ -25,7 +25,8 @@ fn main() {
     let subprocess = Subprocess::new(&handle).unwrap();
     core.run(
         subprocess.backdoor()
-            .and_then(|subprocess| {
+            .and_then(|(response, subprocess)| {
+                println!("{:?}", response);
                 subprocess.close()
             })).unwrap();
 }
