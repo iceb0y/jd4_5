@@ -1,15 +1,158 @@
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix;
-use std::process;
+use std::os::unix::io::{FromRawFd, RawFd};
+use std::process::{self, Command};
+use bincode::{self, Infinite};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use futures::{Future, Stream};
+use futures::sink::Sink;
 use nix::mount;
 use nix::sched;
+use nix::sys::socket;
 use nix::sys::stat::{self, SFlag};
 use nix::sys::wait;
 use nix::unistd::{self, Uid, Gid};
+use serde::{Serialize, Deserialize};
+use tokio_core::reactor::Handle;
+use tokio_io::codec::length_delimited::{self, Framed};
+use tokio_serde_bincode::{ReadBincode, WriteBincode};
+use tokio_uds;
 
-pub fn init() {
+pub struct Sandbox(Framed<tokio_uds::UnixStream>);
+
+#[derive(Serialize, Deserialize)]
+enum Request {
+    Execute(ExecuteCommand),
+    Close,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ExecuteCommand {
+    file: String,
+    // TODO(iceboy): args, open_files, cgroup_file
+}
+
+pub type ExecuteResult = Result<i32, ExecuteError>;
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum ExecuteError {
+    SpawnError,
+    WaitError,
+    Signaled,
+}
+
+const LENGTH_FIELD_LENGTH: usize = 2;
+const MAX_FRAME_LENGTH: usize = 4096;
+
+impl Sandbox {
+    // TODO(iceboy): close existing fds
+    pub fn new(handle: &Handle) -> Sandbox {
+        let (parent_fd, child_fd) = socket::socketpair(
+            socket::AddressFamily::Unix,
+            socket::SockType::Stream,
+            0,
+            socket::SockFlag::empty()).unwrap();
+        match unistd::fork().unwrap() {
+            unistd::ForkResult::Parent { .. } => {
+                unistd::close(child_fd).unwrap();
+            },
+            unistd::ForkResult::Child => {
+                unistd::close(parent_fd).unwrap();
+                do_child(child_fd);
+            },
+        };
+        let net_stream =
+            unsafe { unix::net::UnixStream::from_raw_fd(parent_fd) };
+        let async_stream = tokio_uds::UnixStream::from_stream(
+            net_stream, handle).unwrap();
+        let framed_stream = length_delimited::Builder::new()
+            .little_endian()
+            .length_field_length(LENGTH_FIELD_LENGTH)
+            .max_frame_length(MAX_FRAME_LENGTH)
+            .new_framed(async_stream);
+        Sandbox(framed_stream)
+    }
+
+    pub fn execute<F: Into<String>>(self, file: F)
+        -> impl Future<Item = (ExecuteResult, Sandbox), Error = io::Error> {
+        let command = ExecuteCommand {
+            file: file.into(),
+        };
+        self.call::<ExecuteResult>(Request::Execute(command))
+    }
+
+    pub fn close(self) -> impl Future<Item = (), Error = io::Error> {
+        self.call::<()>(Request::Close).map(|_| ())
+    }
+
+    fn call<ResponseT: for<'a> Deserialize<'a>>(self, request: Request)
+        -> impl Future<Item = (ResponseT, Sandbox), Error = io::Error> {
+        WriteBincode::new(self.0).send(request)
+            .and_then(|sink| {
+                ReadBincode::new(sink.into_inner()).into_future()
+                    .map_err(|(err, _)| {
+                        io::Error::new(io::ErrorKind::InvalidData, err)
+                    })
+            })
+            .and_then(|(maybe_response, source)| {
+                match maybe_response {
+                    Some(response) => {
+                        Ok((response, Sandbox(source.into_inner())))
+                    },
+                    None => {
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData, "empty response"))
+                    },
+                }
+            })
+    }
+}
+
+fn do_child(child_fd: RawFd) -> ! {
+    init_sandbox();
+    let mut stream = unsafe { unix::net::UnixStream::from_raw_fd(child_fd) };
+    let mut buffer = [0; MAX_FRAME_LENGTH];
+    loop {
+        let size = stream.read_u16::<LittleEndian>().unwrap() as usize;
+        assert!(size <= MAX_FRAME_LENGTH);
+        stream.read_exact(&mut buffer[..size]).unwrap();
+        match bincode::deserialize(&buffer[..size]).unwrap() {
+            Request::Execute(command) => do_execute(&command, &mut stream),
+            Request::Close => do_close(&mut stream),
+        };
+    }
+}
+
+fn do_execute(_: &ExecuteCommand, stream: &mut unix::net::UnixStream) {
+    let response = match Command::new("bash").spawn() {
+        Ok(mut child) => match child.wait() {
+            Ok(status) => match status.code() {
+                Some(code) => Ok(code),
+                None => Err(ExecuteError::Signaled),
+            },
+            Err(_) => Err(ExecuteError::WaitError),
+        },
+        Err(_) => Err(ExecuteError::SpawnError),
+    };
+    write_response(stream, &response);
+}
+
+fn do_close(stream: &mut unix::net::UnixStream) -> ! {
+    write_response(stream, &());
+    process::exit(0)
+}
+
+fn write_response<ResponseT: Serialize>(
+    stream: &mut unix::net::UnixStream, response: &ResponseT) {
+    let size = bincode::serialized_size(response) as usize;
+    assert!(size <= MAX_FRAME_LENGTH);
+    stream.write_u16::<LittleEndian>(size as u16).unwrap();
+    bincode::serialize_into(stream, response, Infinite).unwrap();
+}
+
+pub fn init_sandbox() {
     let host_uid = unistd::geteuid();
     let host_gid = unistd::getegid();
     let guest_uid = Uid::from_raw(1000);
