@@ -1,9 +1,10 @@
 use std::env;
+use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::unix;
 use std::os::unix::io::{FromRawFd, RawFd};
-use std::process::{self, Command};
+use std::process;
 use bincode::{self, Infinite};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use futures::{Future, Stream};
@@ -12,7 +13,7 @@ use nix::mount;
 use nix::sched;
 use nix::sys::socket;
 use nix::sys::stat::{self, SFlag};
-use nix::sys::wait;
+use nix::sys::wait::{self, WaitStatus};
 use nix::unistd::{self, Uid, Gid};
 use serde::{Serialize, Deserialize};
 use tokio_core::reactor::Handle;
@@ -30,17 +31,16 @@ enum Request {
 
 #[derive(Serialize, Deserialize)]
 struct ExecuteCommand {
-    file: String,
-    // TODO(iceboy): args, open_files, cgroup_file
+    file: CString,
+    args: Vec<CString>,
+    // TODO(iceboy): open_files, cgroup_file
 }
 
 pub type ExecuteResult = Result<i32, ExecuteError>;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ExecuteError {
-    SpawnError,
-    WaitError,
-    Signaled,
+    Signaled(i32),
 }
 
 const LENGTH_FIELD_LENGTH: usize = 2;
@@ -75,11 +75,9 @@ impl Sandbox {
         Sandbox(framed_stream)
     }
 
-    pub fn execute<F: Into<String>>(self, file: F)
+    pub fn execute(self, file: CString, args: Vec<CString>)
         -> impl Future<Item = (ExecuteResult, Sandbox), Error = io::Error> {
-        let command = ExecuteCommand {
-            file: file.into(),
-        };
+        let command = ExecuteCommand { file: file, args: args };
         self.call::<ExecuteResult>(Request::Execute(command))
     }
 
@@ -119,37 +117,10 @@ fn do_child(child_fd: RawFd) -> ! {
         assert!(size <= MAX_FRAME_LENGTH);
         stream.read_exact(&mut buffer[..size]).unwrap();
         match bincode::deserialize(&buffer[..size]).unwrap() {
-            Request::Execute(command) => do_execute(&command, &mut stream),
+            Request::Execute(command) => do_execute(command, &mut stream),
             Request::Close => do_close(&mut stream),
         };
     }
-}
-
-fn do_execute(_: &ExecuteCommand, stream: &mut unix::net::UnixStream) {
-    let response = match Command::new("bash").spawn() {
-        Ok(mut child) => match child.wait() {
-            Ok(status) => match status.code() {
-                Some(code) => Ok(code),
-                None => Err(ExecuteError::Signaled),
-            },
-            Err(_) => Err(ExecuteError::WaitError),
-        },
-        Err(_) => Err(ExecuteError::SpawnError),
-    };
-    write_response(stream, &response);
-}
-
-fn do_close(stream: &mut unix::net::UnixStream) -> ! {
-    write_response(stream, &());
-    process::exit(0)
-}
-
-fn write_response<ResponseT: Serialize>(
-    stream: &mut unix::net::UnixStream, response: &ResponseT) {
-    let size = bincode::serialized_size(response) as usize;
-    assert!(size <= MAX_FRAME_LENGTH);
-    stream.write_u16::<LittleEndian>(size as u16).unwrap();
-    bincode::serialize_into(stream, response, Infinite).unwrap();
 }
 
 pub fn init_sandbox() {
@@ -166,10 +137,13 @@ pub fn init_sandbox() {
     unistd::setresuid(guest_uid, guest_uid, guest_uid).unwrap();
     unistd::setresgid(guest_gid, guest_gid, guest_gid).unwrap();
     unistd::sethostname("icebox").unwrap();
+    // TODO(iceboy): Reap zombies?
     match unistd::fork().unwrap() {
         unistd::ForkResult::Parent { child } => {
-            wait::waitpid(child, None).unwrap();
-            process::exit(0)
+            match wait::waitpid(child, None).unwrap() {
+                WaitStatus::Exited(_, status) => process::exit(status as i32),
+                e => panic!("{:?}", e),
+            }
         },
         unistd::ForkResult::Child => (),
     }
@@ -257,4 +231,36 @@ fn bind_or_link(source: &str, target: &str) {
         let link = fs::read_link(source).unwrap();
         unix::fs::symlink(link, target).unwrap();
     }
+}
+
+fn do_execute(command: ExecuteCommand, stream: &mut unix::net::UnixStream) {
+    // TODO(iceboy): Reap zombies?
+    let response: ExecuteResult = match unistd::fork().unwrap() {
+        unistd::ForkResult::Parent { child } => {
+            match wait::waitpid(child, None).unwrap() {
+                WaitStatus::Exited(_, status) => Ok(status as i32),
+                WaitStatus::Signaled(_, signal, _) =>
+                    Err(ExecuteError::Signaled(signal as i32)),
+                e => panic!("{:?}", e),
+            }
+        },
+        unistd::ForkResult::Child => {
+            unistd::execv(&command.file, &command.args).unwrap();
+            panic!();
+        },
+    };
+    write_response(stream, &response);
+}
+
+fn do_close(stream: &mut unix::net::UnixStream) -> ! {
+    write_response(stream, &());
+    process::exit(0)
+}
+
+fn write_response<ResponseT: Serialize>(
+    stream: &mut unix::net::UnixStream, response: &ResponseT) {
+    let size = bincode::serialized_size(response) as usize;
+    assert!(size <= MAX_FRAME_LENGTH);
+    stream.write_u16::<LittleEndian>(size as u16).unwrap();
+    bincode::serialize_into(stream, response, Infinite).unwrap();
 }
