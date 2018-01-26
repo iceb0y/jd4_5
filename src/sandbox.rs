@@ -9,6 +9,7 @@ use bincode::{self, Infinite};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use futures::{Future, Stream};
 use futures::sink::Sink;
+use nix::fcntl;
 use nix::mount;
 use nix::sched;
 use nix::sys::socket;
@@ -23,6 +24,19 @@ use tokio_uds;
 
 pub struct Sandbox(Framed<tokio_uds::UnixStream>);
 
+pub type ExecuteResult = Result<i32, ExecuteError>;
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum ExecuteError {
+    Signaled(i32),
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum OpenMode {
+    Read,
+    Write,
+}
+
 #[derive(Serialize, Deserialize)]
 enum Request {
     Execute(ExecuteCommand),
@@ -31,16 +45,10 @@ enum Request {
 
 #[derive(Serialize, Deserialize)]
 struct ExecuteCommand {
-    file: CString,
-    args: Vec<CString>,
-    // TODO(iceboy): open_files, cgroup_file
-}
-
-pub type ExecuteResult = Result<i32, ExecuteError>;
-
-#[derive(Serialize, Deserialize, Debug)]
-pub enum ExecuteError {
-    Signaled(i32),
+    file: String,
+    args: Vec<String>,
+    open_files: Vec<(String, OpenMode, Vec<RawFd>)>,
+    cgroup_file: Option<String>,
 }
 
 const LENGTH_FIELD_LENGTH: usize = 2;
@@ -75,9 +83,18 @@ impl Sandbox {
         Sandbox(framed_stream)
     }
 
-    pub fn execute(self, file: CString, args: Vec<CString>)
-        -> impl Future<Item = (ExecuteResult, Sandbox), Error = io::Error> {
-        let command = ExecuteCommand { file: file, args: args };
+    pub fn execute(
+        self,
+        file: String,
+        args: Vec<String>,
+        open_files: Vec<(String, OpenMode, Vec<RawFd>)>,
+    ) -> impl Future<Item = (ExecuteResult, Sandbox), Error = io::Error> {
+        let command = ExecuteCommand {
+            file: file,
+            args: args,
+            open_files: open_files,
+            cgroup_file: None,
+        };
         self.call::<ExecuteResult>(Request::Execute(command))
     }
 
@@ -117,7 +134,8 @@ fn do_child(child_fd: RawFd) -> ! {
         assert!(size <= MAX_FRAME_LENGTH);
         stream.read_exact(&mut buffer[..size]).unwrap();
         match bincode::deserialize(&buffer[..size]).unwrap() {
-            Request::Execute(command) => do_execute(command, &mut stream),
+            Request::Execute(command) =>
+                do_execute(child_fd, command, &mut stream),
             Request::Close => do_close(&mut stream),
         };
     }
@@ -233,7 +251,11 @@ fn bind_or_link(source: &str, target: &str) {
     }
 }
 
-fn do_execute(command: ExecuteCommand, stream: &mut unix::net::UnixStream) {
+fn do_execute(
+    socket_fd: RawFd,
+    command: ExecuteCommand,
+    stream: &mut unix::net::UnixStream
+) {
     // TODO(iceboy): Reap zombies?
     let response: ExecuteResult = match unistd::fork().unwrap() {
         unistd::ForkResult::Parent { child } => {
@@ -245,7 +267,30 @@ fn do_execute(command: ExecuteCommand, stream: &mut unix::net::UnixStream) {
             }
         },
         unistd::ForkResult::Child => {
-            unistd::execv(&command.file, &command.args).unwrap();
+            unistd::close(socket_fd).unwrap();
+            for (file, open_mode, target_fds) in command.open_files {
+                let flag = match open_mode {
+                    OpenMode::Read => fcntl::O_RDONLY,
+                    OpenMode::Write => fcntl::O_WRONLY,
+                };
+                let source_fd = fcntl::open(
+                    file.as_str(), flag, stat::Mode::empty()).unwrap();
+                let mut need_close = true;
+                for target_fd in target_fds {
+                    unistd::dup2(source_fd, target_fd).unwrap();
+                    if source_fd == target_fd {
+                        need_close = false;
+                    }
+                }
+                if need_close {
+                    unistd::close(source_fd).unwrap();
+                }
+            }
+            let file = CString::new(command.file).unwrap();
+            let args = command.args.into_iter()
+                .map(|arg| CString::new(arg).unwrap())
+                .collect::<Vec<_>>();
+            unistd::execv(&file, &args).unwrap();
             panic!();
         },
     };
