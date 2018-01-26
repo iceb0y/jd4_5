@@ -275,14 +275,10 @@ fn do_execute(
                 };
                 let source_fd = fcntl::open(
                     file.as_str(), flag, stat::Mode::empty()).unwrap();
-                let mut need_close = true;
-                for target_fd in target_fds {
-                    unistd::dup2(source_fd, target_fd).unwrap();
-                    if source_fd == target_fd {
-                        need_close = false;
-                    }
+                for target_fd in &target_fds {
+                    unistd::dup2(source_fd, *target_fd).unwrap();
                 }
-                if need_close {
+                if target_fds.into_iter().any(|fd| fd == source_fd) {
                     unistd::close(source_fd).unwrap();
                 }
             }
