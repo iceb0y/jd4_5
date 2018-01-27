@@ -1,19 +1,19 @@
 extern crate futures;
 extern crate jd4_5;
+extern crate tempdir;
 extern crate tokio_core;
 
 use std::process;
 use futures::Future;
-use jd4_5::sandbox::Sandbox;
+use jd4_5::sandbox::{Bind, Sandbox};
 use tokio_core::reactor::Core;
 
 fn main() {
     let mut core = Core::new().unwrap();
-    let sandbox = Sandbox::new(&core.handle());
-    let file = String::from("/bin/bash");
-    let args = vec![String::from("bunny")];
-    let open_files = vec![];
-    let future = sandbox.execute(file, args, open_files)
+    let future = Sandbox::new(&Bind::defaults(), &core.handle())
+        .and_then(|sandbox| {
+            sandbox.execute("/bin/bash", vec![String::from("bunny")], vec![])
+        })
         .and_then(|(result, sandbox)| {
             sandbox.close().map(|()| result)
         });

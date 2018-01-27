@@ -8,6 +8,7 @@ extern crate byteorder;
 extern crate futures;
 extern crate nix;
 extern crate serde;
+extern crate tempdir;
 extern crate tokio_core;
 extern crate tokio_io;
 extern crate tokio_serde_bincode;
