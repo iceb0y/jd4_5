@@ -208,11 +208,6 @@ pub fn init_sandbox() {
     mount::mount(Some("/"),
                  "/",
                  None as Option<&[u8]>,
-                 mount::MS_BIND | mount::MS_REC | mount::MS_NOSUID,
-                 None as Option<&[u8]>).unwrap();
-    mount::mount(Some("/"),
-                 "/",
-                 None as Option<&[u8]>,
                  mount::MS_BIND | mount::MS_REMOUNT | mount::MS_RDONLY |
                  mount::MS_REC | mount::MS_NOSUID,
                  None as Option<&[u8]>).unwrap();
@@ -244,6 +239,12 @@ fn bind_or_link(source: &str, target: &str) {
                      target,
                      None as Option<&[u8]>,
                      mount::MS_BIND | mount::MS_REC | mount::MS_NOSUID,
+                     None as Option<&[u8]>).unwrap();
+        mount::mount(Some(source),
+                     target,
+                     None as Option<&[u8]>,
+                     mount::MS_BIND | mount::MS_REMOUNT | mount::MS_RDONLY |
+                     mount::MS_REC | mount::MS_NOSUID,
                      None as Option<&[u8]>).unwrap();
     } else if file_type.is_symlink() {
         let link = fs::read_link(source).unwrap();
