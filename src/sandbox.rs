@@ -78,18 +78,16 @@ const LENGTH_FIELD_LENGTH: usize = 2;
 const MAX_FRAME_LENGTH: usize = 4096;
 
 impl Bind {
-    pub fn new<S: AsRef<Path>, T: AsRef<Path>>(
+    pub fn new<S: Into<PathBuf>, T: Into<PathBuf>>(
         source: S,
         target: T,
         mode: AccessMode
     ) -> Bind {
-        assert!(source.as_ref().is_absolute());
-        assert!(target.as_ref().is_relative());
-        Bind {
-            source: source.as_ref().to_path_buf(),
-            target: target.as_ref().to_path_buf(),
-            mode: mode,
-        }
+        let source = source.into();
+        let target = target.into();
+        assert!(source.is_absolute());
+        assert!(target.is_relative());
+        Bind { source: source, target: target, mode: mode }
     }
 
     pub fn defaults() -> Vec<Bind> {
@@ -148,14 +146,14 @@ impl Sandbox {
         self.call::<()>(Request::Ping).map(|(_, sandbox)| sandbox)
     }
 
-    pub fn execute<F: AsRef<Path>>(
+    pub fn execute<F: Into<PathBuf>>(
         self,
         file: F,
         args: Vec<String>,
         open_files: Vec<OpenFile>,
     ) -> impl Future<Item = (ExecuteResult, Sandbox), Error = io::Error> {
         let command = ExecuteCommand {
-            file: file.as_ref().to_path_buf(),
+            file: file.into(),
             args: args,
             open_files: open_files,
             cgroup_file: None,
