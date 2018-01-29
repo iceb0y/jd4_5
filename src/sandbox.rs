@@ -256,7 +256,7 @@ pub fn init_sandbox<M: AsRef<Path>>(mount_dir: M, binds: &[Bind]) {
                  Some("tmpfs"),
                  mount::MS_NOSUID,
                  Some("size=16m,nr_inodes=4k")).unwrap();
-    binds.iter().for_each(|bind| bind_or_link(bind));
+    binds.iter().for_each(bind_or_link);
     write_file("etc/passwd", "icebox:x:1000:1000:icebox:/:/bin/bash\n");
     fs::create_dir("old_root").unwrap();
     unistd::pivot_root(".", "old_root").unwrap();
