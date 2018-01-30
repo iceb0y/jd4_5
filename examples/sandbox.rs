@@ -14,9 +14,7 @@ fn main() {
         .and_then(|sandbox| {
             sandbox.execute("/bin/bash", vec![String::from("bunny")], vec![])
         })
-        .and_then(|(result, sandbox)| {
-            sandbox.close().map(|()| result)
-        });
+        .map(|(result, _)| result);
     let result = core.run(future).unwrap();
     process::exit(result.unwrap());
 }

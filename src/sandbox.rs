@@ -46,14 +46,14 @@ pub enum ExecuteError {
     Signaled(i32),
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct OpenFile {
     file: PathBuf,
     fds: Vec<RawFd>,
     mode: OpenMode,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum OpenMode {
     ReadOnly,
     WriteOnly,
@@ -63,7 +63,6 @@ pub enum OpenMode {
 enum Request {
     Ping,
     Execute(ExecuteCommand),
-    Close,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -87,7 +86,7 @@ impl Bind {
         let target = target.into();
         assert!(source.is_absolute());
         assert!(target.is_relative());
-        Bind { source: source, target: target, mode: mode }
+        Bind { source, target, mode }
     }
 
     pub fn defaults() -> Vec<Bind> {
@@ -104,6 +103,13 @@ impl Bind {
             Bind::new("/usr/share", "usr/share", AccessMode::ReadOnly),
             Bind::new("/var/lib/ghc", "var/lib/ghc", AccessMode::ReadOnly),
         ]
+    }
+}
+
+impl OpenFile {
+    pub fn new<F: Into<PathBuf>>(
+        file: F, fds: Vec<RawFd>, mode: OpenMode) -> OpenFile {
+        OpenFile { file: file.into(), fds, mode }
     }
 }
 
@@ -136,14 +142,10 @@ impl Sandbox {
             .max_frame_length(MAX_FRAME_LENGTH)
             .new_framed(async_stream);
         let sandbox = Sandbox(framed_stream);
-        sandbox.ping().map(|sandbox| {
+        sandbox.call::<()>(Request::Ping).map(|(_, sandbox)| {
             mount_dir.close().unwrap();
             sandbox
         })
-    }
-
-    pub fn ping(self) -> impl Future<Item = Sandbox, Error = io::Error> {
-        self.call::<()>(Request::Ping).map(|(_, sandbox)| sandbox)
     }
 
     pub fn execute<F: Into<PathBuf>>(
@@ -159,10 +161,6 @@ impl Sandbox {
             cgroup_file: None,
         };
         self.call::<ExecuteResult>(Request::Execute(command))
-    }
-
-    pub fn close(self) -> impl Future<Item = (), Error = io::Error> {
-        self.call::<()>(Request::Close).map(|_| ())
     }
 
     fn call<ResponseT: for<'a> Deserialize<'a>>(self, request: Request)
@@ -197,14 +195,18 @@ fn do_child<M: AsRef<Path>>(
     let mut stream = unsafe { unix::net::UnixStream::from_raw_fd(child_fd) };
     let mut buffer = [0; MAX_FRAME_LENGTH];
     loop {
-        let size = stream.read_u16::<LittleEndian>().unwrap() as usize;
+        let size = match stream.read_u16::<LittleEndian>() {
+            Ok(size) => size as usize,
+            Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof =>
+                process::exit(0),
+            Err(e) => panic!("{:?}", e),
+        };
         assert!(size <= MAX_FRAME_LENGTH);
         stream.read_exact(&mut buffer[..size]).unwrap();
         match bincode::deserialize(&buffer[..size]).unwrap() {
             Request::Ping => write_response(&mut stream, &()),
             Request::Execute(command) =>
                 do_execute(child_fd, command, &mut stream),
-            Request::Close => do_close(&mut stream),
         };
     }
 }
@@ -349,16 +351,12 @@ fn do_execute(
             let args = command.args.into_iter()
                 .map(|arg| CString::new(arg).unwrap())
                 .collect::<Vec<_>>();
-            unistd::execv(&file, &args).unwrap();
+            let env = vec![];
+            unistd::execve(&file, &args, &env).unwrap();
             panic!();
         },
     };
     write_response(stream, &response);
-}
-
-fn do_close(stream: &mut unix::net::UnixStream) -> ! {
-    write_response(stream, &());
-    process::exit(0)
 }
 
 fn write_response<ResponseT: Serialize>(
@@ -367,4 +365,33 @@ fn write_response<ResponseT: Serialize>(
     assert!(size <= MAX_FRAME_LENGTH);
     stream.write_u16::<LittleEndian>(size as u16).unwrap();
     bincode::serialize_into(stream, response, Infinite).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_core::reactor::Core;
+
+    #[test]
+    fn whoami() {
+        let mut core = Core::new().unwrap();
+        let tempdir = TempDir::new("sandbox-test").unwrap();
+        let mut binds = Bind::defaults();
+        let stdout_path = tempdir.path().join("stdout");
+        File::create(&stdout_path).unwrap();
+        binds.push(Bind::new(tempdir.path(), "test", AccessMode::ReadWrite));
+        let future = Sandbox::new(&binds, &core.handle())
+            .and_then(|sandbox| {
+                sandbox.execute(
+                    "/usr/bin/whoami",
+                    vec![String::from("whoami")],
+                    vec![OpenFile::new("/test/stdout", vec![1], OpenMode::WriteOnly)])
+            })
+            .map(|(result, _)| result);
+        let result = core.run(future).unwrap();
+        assert_eq!(result.unwrap(), 0);
+        let mut data = String::new();
+        File::open(&stdout_path).unwrap().read_to_string(&mut data).unwrap();
+        assert_eq!(data, "icebox\n");
+    }
 }
