@@ -56,3 +56,31 @@ fn do_pipe<T>(rx: mpsc::Receiver<Operation<T>>)
         Ok(())
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_core::reactor::Core;
+
+    #[test]
+    fn one() {
+        let mut core = Core::new().unwrap();
+        let pool = Pool::new(&core.handle());
+        let future = pool.put("A")
+            .and_then(|()| pool.put("B"))
+            .and_then(|()| pool.get(1));
+        let result = core.run(future).unwrap();
+        assert_eq!(result, vec!["B"]);
+    }
+
+    #[test]
+    fn two() {
+        let mut core = Core::new().unwrap();
+        let pool = Pool::new(&core.handle());
+        let future = pool.put("A")
+            .and_then(|()| pool.put("B"))
+            .and_then(|()| pool.get(2));
+        let result = core.run(future).unwrap();
+        assert_eq!(result, vec!["A", "B"]);
+    }
+}
