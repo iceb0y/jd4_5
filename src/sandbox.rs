@@ -394,4 +394,19 @@ mod tests {
         File::open(&stdout_path).unwrap().read_to_string(&mut data).unwrap();
         assert_eq!(data, "icebox\n");
     }
+
+    #[test]
+    fn read_only() {
+        let mut core = Core::new().unwrap();
+        let future = Sandbox::new(&Bind::defaults(), &core.handle())
+            .and_then(|sandbox| {
+                sandbox.execute(
+                    "/usr/bin/touch",
+                    vec![String::from("touch"), String::from("/bin/dummy")],
+                    vec![OpenFile::new("/dev/null", vec![2], OpenMode::WriteOnly)])
+            })
+            .map(|(result, _)| result);
+        let result = core.run(future).unwrap();
+        assert_ne!(result.unwrap(), 0);
+    }
 }
