@@ -24,20 +24,10 @@ use tokio_io::codec::length_delimited::{self, Framed};
 use tokio_serde_bincode::{ReadBincode, WriteBincode};
 use tokio_uds;
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Bind {
-    source: PathBuf,
-    target: PathBuf,
-    mode: AccessMode,
+pub struct Sandbox {
+    stream: Framed<tokio_uds::UnixStream>,
+    dir: TempDir,
 }
-
-#[derive(Serialize, Deserialize, Debug)]
-pub enum AccessMode {
-    ReadOnly,
-    ReadWrite,
-}
-
-pub struct Sandbox(Framed<tokio_uds::UnixStream>);
 
 pub type ExecuteResult = Result<i32, ExecuteError>;
 
@@ -61,7 +51,6 @@ pub enum OpenMode {
 
 #[derive(Serialize, Deserialize)]
 enum Request {
-    Ping,
     Execute(ExecuteCommand),
 }
 
@@ -73,8 +62,106 @@ struct ExecuteCommand {
     cgroup_file: Option<PathBuf>,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct Bind {
+    source: PathBuf,
+    target: PathBuf,
+    mode: AccessMode,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+enum AccessMode {
+    ReadOnly,
+    ReadWrite,
+}
+
 const LENGTH_FIELD_LENGTH: usize = 2;
 const MAX_FRAME_LENGTH: usize = 4096;
+
+impl Sandbox {
+    // TODO(iceboy): close existing fds
+    pub fn new(handle: &Handle) -> Sandbox {
+        let (parent_fd, child_fd) = socket::socketpair(
+            socket::AddressFamily::Unix,
+            socket::SockType::Stream,
+            0,
+            socket::SockFlag::empty()).unwrap();
+        let sandbox_dir = TempDir::new("sandbox").unwrap();
+        let in_dir = sandbox_dir.path().join("in");
+        fs::create_dir(&in_dir).unwrap();
+        let out_dir = sandbox_dir.path().join("out");
+        fs::create_dir(&out_dir).unwrap();
+        let mount_dir = sandbox_dir.path().join("mount");
+        fs::create_dir(&mount_dir).unwrap();
+        let mut binds = Bind::defaults();
+        binds.push(Bind::new(&in_dir, "in", AccessMode::ReadOnly));
+        binds.push(Bind::new(&out_dir, "out", AccessMode::ReadWrite));
+        match unistd::fork().unwrap() {
+            unistd::ForkResult::Parent { .. } => {
+                unistd::close(child_fd).unwrap();
+            },
+            unistd::ForkResult::Child => {
+                unistd::close(parent_fd).unwrap();
+                do_child(&mount_dir, &binds, child_fd);
+            },
+        };
+        let net_stream =
+            unsafe { unix::net::UnixStream::from_raw_fd(parent_fd) };
+        let async_stream = tokio_uds::UnixStream::from_stream(
+            net_stream, handle).unwrap();
+        let framed_stream = length_delimited::Builder::new()
+            .little_endian()
+            .length_field_length(LENGTH_FIELD_LENGTH)
+            .max_frame_length(MAX_FRAME_LENGTH)
+            .new_framed(async_stream);
+        Sandbox { stream: framed_stream, dir: sandbox_dir }
+    }
+
+    pub fn in_dir(&self) -> PathBuf { self.dir.path().join("in") }
+    pub fn out_dir(&self) -> PathBuf { self.dir.path().join("out") }
+
+    pub fn execute<F: Into<PathBuf>>(
+        self,
+        file: F,
+        args: Vec<String>,
+        open_files: Vec<OpenFile>,
+    ) -> impl Future<Item = (ExecuteResult, Sandbox), Error = io::Error> {
+        let command = ExecuteCommand {
+            file: file.into(),
+            args: args,
+            open_files: open_files,
+            cgroup_file: None,
+        };
+        self.call::<ExecuteResult>(Request::Execute(command))
+    }
+
+    fn call<ResponseT: for<'a> Deserialize<'a>>(self, request: Request)
+        -> impl Future<Item = (ResponseT, Sandbox), Error = io::Error> {
+        let Sandbox { stream, dir } = self;
+        WriteBincode::new(stream).send(request)
+            .and_then(|sink| {
+                ReadBincode::new(sink.into_inner()).into_future()
+                    .map_err(|(err, _)| {
+                        io::Error::new(io::ErrorKind::InvalidData, err)
+                    })
+            })
+            .and_then(|(maybe_response, source)| {
+                match maybe_response {
+                    Some(response) => {
+                        let sandbox = Sandbox {
+                            stream: source.into_inner(),
+                            dir: dir,
+                        };
+                        Ok((response, sandbox))
+                    },
+                    None => {
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData, "empty response"))
+                    },
+                }
+            })
+    }
+}
 
 impl Bind {
     pub fn new<S: Into<PathBuf>, T: Into<PathBuf>>(
@@ -113,79 +200,6 @@ impl OpenFile {
     }
 }
 
-impl Sandbox {
-    // TODO(iceboy): close existing fds
-    pub fn new(binds: &[Bind], handle: &Handle)
-        -> impl Future<Item = Sandbox, Error = io::Error> {
-        let (parent_fd, child_fd) = socket::socketpair(
-            socket::AddressFamily::Unix,
-            socket::SockType::Stream,
-            0,
-            socket::SockFlag::empty()).unwrap();
-        let mount_dir = TempDir::new("sandbox-mount").unwrap();
-        match unistd::fork().unwrap() {
-            unistd::ForkResult::Parent { .. } => {
-                unistd::close(child_fd).unwrap();
-            },
-            unistd::ForkResult::Child => {
-                unistd::close(parent_fd).unwrap();
-                do_child(mount_dir.into_path(), binds, child_fd);
-            },
-        };
-        let net_stream =
-            unsafe { unix::net::UnixStream::from_raw_fd(parent_fd) };
-        let async_stream = tokio_uds::UnixStream::from_stream(
-            net_stream, handle).unwrap();
-        let framed_stream = length_delimited::Builder::new()
-            .little_endian()
-            .length_field_length(LENGTH_FIELD_LENGTH)
-            .max_frame_length(MAX_FRAME_LENGTH)
-            .new_framed(async_stream);
-        let sandbox = Sandbox(framed_stream);
-        sandbox.call::<()>(Request::Ping).map(|(_, sandbox)| {
-            mount_dir.close().unwrap();
-            sandbox
-        })
-    }
-
-    pub fn execute<F: Into<PathBuf>>(
-        self,
-        file: F,
-        args: Vec<String>,
-        open_files: Vec<OpenFile>,
-    ) -> impl Future<Item = (ExecuteResult, Sandbox), Error = io::Error> {
-        let command = ExecuteCommand {
-            file: file.into(),
-            args: args,
-            open_files: open_files,
-            cgroup_file: None,
-        };
-        self.call::<ExecuteResult>(Request::Execute(command))
-    }
-
-    fn call<ResponseT: for<'a> Deserialize<'a>>(self, request: Request)
-        -> impl Future<Item = (ResponseT, Sandbox), Error = io::Error> {
-        WriteBincode::new(self.0).send(request)
-            .and_then(|sink| {
-                ReadBincode::new(sink.into_inner()).into_future()
-                    .map_err(|(err, _)| {
-                        io::Error::new(io::ErrorKind::InvalidData, err)
-                    })
-            })
-            .and_then(|(maybe_response, source)| {
-                match maybe_response {
-                    Some(response) => {
-                        Ok((response, Sandbox(source.into_inner())))
-                    },
-                    None => {
-                        Err(io::Error::new(
-                            io::ErrorKind::InvalidData, "empty response"))
-                    },
-                }
-            })
-    }
-}
-
 fn do_child<M: AsRef<Path>>(
     mount_dir: M,
     binds: &[Bind],
@@ -204,14 +218,13 @@ fn do_child<M: AsRef<Path>>(
         assert!(size <= MAX_FRAME_LENGTH);
         stream.read_exact(&mut buffer[..size]).unwrap();
         match bincode::deserialize(&buffer[..size]).unwrap() {
-            Request::Ping => write_response(&mut stream, &()),
             Request::Execute(command) =>
                 do_execute(child_fd, command, &mut stream),
         };
     }
 }
 
-pub fn init_sandbox<M: AsRef<Path>>(mount_dir: M, binds: &[Bind]) {
+fn init_sandbox<M: AsRef<Path>>(mount_dir: M, binds: &[Bind]) {
     let host_uid = unistd::geteuid();
     let host_gid = unistd::getegid();
     let guest_uid = Uid::from_raw(1000);
@@ -375,38 +388,30 @@ mod tests {
     #[test]
     fn whoami() {
         let mut core = Core::new().unwrap();
-        let tempdir = TempDir::new("sandbox-test").unwrap();
-        let mut binds = Bind::defaults();
-        let stdout_path = tempdir.path().join("stdout");
+        let sandbox = Sandbox::new(&core.handle());
+        let stdout_path = sandbox.out_dir().join("stdout");
         File::create(&stdout_path).unwrap();
-        binds.push(Bind::new(tempdir.path(), "test", AccessMode::ReadWrite));
-        let future = Sandbox::new(&binds, &core.handle())
-            .and_then(|sandbox| {
-                sandbox.execute(
-                    "/usr/bin/whoami",
-                    vec![String::from("whoami")],
-                    vec![OpenFile::new("/test/stdout", vec![1], OpenMode::WriteOnly)])
-            })
-            .map(|(result, _)| result);
-        let result = core.run(future).unwrap();
+        let future = sandbox.execute(
+            "/usr/bin/whoami",
+            vec![String::from("whoami")],
+            vec![OpenFile::new("/out/stdout", vec![1], OpenMode::WriteOnly)]);
+        let (result, sandbox) = core.run(future).unwrap();
         assert_eq!(result.unwrap(), 0);
         let mut data = String::new();
         File::open(&stdout_path).unwrap().read_to_string(&mut data).unwrap();
         assert_eq!(data, "icebox\n");
+        drop(sandbox);
     }
 
     #[test]
     fn read_only() {
         let mut core = Core::new().unwrap();
-        let future = Sandbox::new(&Bind::defaults(), &core.handle())
-            .and_then(|sandbox| {
-                sandbox.execute(
-                    "/usr/bin/touch",
-                    vec![String::from("touch"), String::from("/bin/dummy")],
-                    vec![OpenFile::new("/dev/null", vec![2], OpenMode::WriteOnly)])
-            })
-            .map(|(result, _)| result);
-        let result = core.run(future).unwrap();
+        let sandbox = Sandbox::new(&core.handle());
+        let future = sandbox.execute(
+            "/usr/bin/touch",
+            vec![String::from("touch"), String::from("/bin/dummy")],
+            vec![OpenFile::new("/dev/null", vec![2], OpenMode::WriteOnly)]);
+        let (result, _) = core.run(future).unwrap();
         assert_ne!(result.unwrap(), 0);
     }
 }
