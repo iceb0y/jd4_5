@@ -36,14 +36,14 @@ pub enum ExecuteError {
     Signaled(i32),
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct OpenFile {
     file: PathBuf,
     fds: Vec<RawFd>,
     mode: OpenMode,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum OpenMode {
     ReadOnly,
     WriteOnly,
@@ -123,13 +123,13 @@ impl Sandbox {
     pub fn execute<F: Into<PathBuf>>(
         self,
         file: F,
-        args: Vec<String>,
-        open_files: Vec<OpenFile>,
+        args: &[&str],
+        open_files: &[OpenFile],
     ) -> impl Future<Item = (ExecuteResult, Sandbox), Error = io::Error> {
         let command = ExecuteCommand {
             file: file.into(),
-            args: args,
-            open_files: open_files,
+            args: args.iter().map(|&s| s.to_string()).collect(),
+            open_files: open_files.iter().cloned().collect(),
             cgroup_file: None,
         };
         self.call::<ExecuteResult>(Request::Execute(command))
@@ -163,8 +163,15 @@ impl Sandbox {
     }
 }
 
+impl OpenFile {
+    pub fn new<F: Into<PathBuf>>(
+        file: F, fds: Vec<RawFd>, mode: OpenMode) -> OpenFile {
+        OpenFile { file: file.into(), fds, mode }
+    }
+}
+
 impl Bind {
-    pub fn new<S: Into<PathBuf>, T: Into<PathBuf>>(
+    fn new<S: Into<PathBuf>, T: Into<PathBuf>>(
         source: S,
         target: T,
         mode: AccessMode
@@ -176,7 +183,7 @@ impl Bind {
         Bind { source, target, mode }
     }
 
-    pub fn defaults() -> Vec<Bind> {
+    fn defaults() -> Vec<Bind> {
         vec![
             Bind::new("/bin", "bin", AccessMode::ReadOnly),
             Bind::new("/etc/alternatives", "etc/alternatives", AccessMode::ReadOnly),
@@ -190,13 +197,6 @@ impl Bind {
             Bind::new("/usr/share", "usr/share", AccessMode::ReadOnly),
             Bind::new("/var/lib/ghc", "var/lib/ghc", AccessMode::ReadOnly),
         ]
-    }
-}
-
-impl OpenFile {
-    pub fn new<F: Into<PathBuf>>(
-        file: F, fds: Vec<RawFd>, mode: OpenMode) -> OpenFile {
-        OpenFile { file: file.into(), fds, mode }
     }
 }
 
@@ -352,18 +352,18 @@ fn do_execute(
                 };
                 let source_fd =
                     fcntl::open(&file, flag, stat::Mode::empty()).unwrap();
-                for target_fd in &fds {
-                    unistd::dup2(source_fd, *target_fd).unwrap();
+                for &target_fd in &fds {
+                    unistd::dup2(source_fd, target_fd).unwrap();
                 }
-                if fds.into_iter().any(|fd| fd == source_fd) {
+                if fds.iter().any(|&fd| fd == source_fd) {
                     unistd::close(source_fd).unwrap();
                 }
             }
             let file = CString::new(
                 command.file.as_os_str().to_str().unwrap()).unwrap();
-            let args = command.args.into_iter()
+            let args: Vec<_> = command.args.into_iter()
                 .map(|arg| CString::new(arg).unwrap())
-                .collect::<Vec<_>>();
+                .collect();
             let env = vec![];
             unistd::execve(&file, &args, &env).unwrap();
             panic!();
@@ -392,9 +392,8 @@ mod tests {
         let stdout_path = sandbox.out_dir().join("stdout");
         File::create(&stdout_path).unwrap();
         let future = sandbox.execute(
-            "/usr/bin/whoami",
-            vec![String::from("whoami")],
-            vec![OpenFile::new("/out/stdout", vec![1], OpenMode::WriteOnly)]);
+            "/usr/bin/whoami", &["whoami"],
+            &[OpenFile::new("/out/stdout", vec![1], OpenMode::WriteOnly)]);
         let (result, sandbox) = core.run(future).unwrap();
         assert_eq!(result.unwrap(), 0);
         let mut data = String::new();
@@ -408,9 +407,8 @@ mod tests {
         let mut core = Core::new().unwrap();
         let sandbox = Sandbox::new(&core.handle());
         let future = sandbox.execute(
-            "/usr/bin/touch",
-            vec![String::from("touch"), String::from("/bin/dummy")],
-            vec![OpenFile::new("/dev/null", vec![2], OpenMode::WriteOnly)]);
+            "/usr/bin/touch", &["touch", "/bin/dummy"],
+            &[OpenFile::new("/dev/null", vec![2], OpenMode::WriteOnly)]);
         let (result, _) = core.run(future).unwrap();
         assert_ne!(result.unwrap(), 0);
     }
