@@ -1,60 +1,44 @@
 use std::collections::VecDeque;
-use futures::{Future, Sink};
-use futures::stream::Stream;
-use futures::sync::mpsc;
+use futures::Future;
 use futures::sync::oneshot;
-use tokio_core::reactor::Handle;
 
-pub struct Pool<T>(mpsc::Sender<Operation<T>>);
-
-enum Operation<T> {
-    Put(T),
-    Get(usize, oneshot::Sender<Vec<T>>),
+pub struct Pool<T> {
+    puts: Vec<T>,
+    gets: VecDeque<(usize, oneshot::Sender<Vec<T>>)>,
 }
 
-impl<T: 'static> Pool<T> {
-    pub fn new(handle: &Handle) -> Pool<T> {
-        let (tx, rx) = mpsc::channel(1);
-        handle.spawn(do_pipe(rx));
-        Pool(tx)
+impl<T> Pool<T> {
+    pub fn new() -> Pool<T> {
+        Pool { gets: VecDeque::new(), puts: Vec::new() }
     }
 
-    pub fn put(&self, item: T) -> impl Future<Item = (), Error = ()> {
-        self.0.clone().send(Operation::Put(item))
-            .then(|result| { result.unwrap(); Ok(()) })
+    pub fn put(&mut self, item: T) {
+        self.puts.push(item);
+        self.do_marry();
     }
 
-    pub fn get(&self, amt: usize) -> impl Future<Item = Vec<T>, Error = ()> {
+    pub fn get(&mut self, amt: usize)
+        -> impl Future<Item = Vec<T>, Error = ()> {
         let (tx, rx) = oneshot::channel();
-        self.0.clone().send(Operation::Get(amt, tx))
-            .then(|result| { result.unwrap(); rx })
-            .then(|result| Ok(result.unwrap()))
+        self.gets.push_back((amt, tx));
+        self.do_marry();
+        rx.map_err(|_| panic!())
     }
-}
 
-fn do_pipe<T>(rx: mpsc::Receiver<Operation<T>>)
-    -> impl Future<Item = (), Error = ()> {
-    let mut put_stack = Vec::new();
-    let mut get_queue = VecDeque::new();
-    rx.for_each(move |operation| {
-        match operation {
-            Operation::Put(item) => put_stack.push(item),
-            Operation::Get(amt, tx) => get_queue.push_back((amt, tx)),
-        }
-        match get_queue.pop_front() {
+    fn do_marry(&mut self) {
+        match self.gets.pop_front() {
             Some((amt, tx)) => {
-                if put_stack.len() >= amt {
-                    let at = put_stack.len() - amt;
-                    tx.send(put_stack.split_off(at))
+                if self.puts.len() >= amt {
+                    let at = self.puts.len() - amt;
+                    tx.send(self.puts.split_off(at))
                         .unwrap_or_else(|_| panic!());
                 } else {
-                    get_queue.push_front((amt, tx));
+                    self.gets.push_front((amt, tx));
                 }
             },
             None => (),
         }
-        Ok(())
-    })
+    }
 }
 
 #[cfg(test)]
@@ -64,23 +48,21 @@ mod tests {
 
     #[test]
     fn one() {
+        let mut pool = Pool::new();
+        pool.put("A");
+        pool.put("B");
         let mut core = Core::new().unwrap();
-        let pool = Pool::new(&core.handle());
-        let future = pool.put("A")
-            .and_then(|()| pool.put("B"))
-            .and_then(|()| pool.get(1));
-        let result = core.run(future).unwrap();
+        let result = core.run(pool.get(1)).unwrap();
         assert_eq!(result, vec!["B"]);
     }
 
     #[test]
     fn two() {
+        let mut pool = Pool::new();
+        pool.put("A");
+        pool.put("B");
         let mut core = Core::new().unwrap();
-        let pool = Pool::new(&core.handle());
-        let future = pool.put("A")
-            .and_then(|()| pool.put("B"))
-            .and_then(|()| pool.get(2));
-        let result = core.run(future).unwrap();
+        let result = core.run(pool.get(2)).unwrap();
         assert_eq!(result, vec!["A", "B"]);
     }
 }

@@ -58,6 +58,7 @@ enum Request {
 struct ExecuteCommand {
     file: PathBuf,
     args: Vec<String>,
+    env: Vec<String>,
     open_files: Vec<OpenFile>,
     cgroup_file: Option<PathBuf>,
 }
@@ -124,11 +125,13 @@ impl Sandbox {
         self,
         file: F,
         args: &[&str],
+        env: &[&str],
         open_files: &[OpenFile],
     ) -> impl Future<Item = (ExecuteResult, Sandbox), Error = io::Error> {
         let command = ExecuteCommand {
             file: file.into(),
             args: args.iter().map(|&s| s.to_string()).collect(),
+            env: env.iter().map(|&s| s.to_string()).collect(),
             open_files: open_files.iter().cloned().collect(),
             cgroup_file: None,
         };
@@ -364,7 +367,9 @@ fn do_execute(
             let args: Vec<_> = command.args.into_iter()
                 .map(|arg| CString::new(arg).unwrap())
                 .collect();
-            let env = vec![];
+            let env: Vec<_> = command.env.into_iter()
+                .map(|arg| CString::new(arg).unwrap())
+                .collect();
             unistd::execve(&file, &args, &env).unwrap();
             panic!();
         },
@@ -392,7 +397,9 @@ mod tests {
         let stdout_path = sandbox.out_dir().join("stdout");
         File::create(&stdout_path).unwrap();
         let future = sandbox.execute(
-            "/usr/bin/whoami", &["whoami"],
+            "/usr/bin/whoami",
+            &["whoami"],
+            &["PATH=/usr/bin:/bin", "HOME=/"],
             &[OpenFile::new("/out/stdout", vec![1], OpenMode::WriteOnly)]);
         let (result, sandbox) = core.run(future).unwrap();
         assert_eq!(result.unwrap(), 0);
@@ -407,7 +414,9 @@ mod tests {
         let mut core = Core::new().unwrap();
         let sandbox = Sandbox::new(&core.handle());
         let future = sandbox.execute(
-            "/usr/bin/touch", &["touch", "/bin/dummy"],
+            "/usr/bin/touch",
+            &["touch", "/bin/dummy"],
+            &["PATH=/usr/bin:/bin", "HOME=/"],
             &[OpenFile::new("/dev/null", vec![2], OpenMode::WriteOnly)]);
         let (result, _) = core.run(future).unwrap();
         assert_ne!(result.unwrap(), 0);

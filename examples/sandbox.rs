@@ -10,7 +10,11 @@ use tokio_core::reactor::Core;
 fn main() {
     let mut core = Core::new().unwrap();
     let sandbox = Sandbox::new(&core.handle());
-    let future = sandbox.execute("/bin/bash", &["bunny"], &[]);
+    let future = sandbox.execute(
+        "/bin/bash",
+        &["bunny"],
+        &["PATH=/usr/bin:/bin", "HOME=/"],
+        &[]);
     let (result, _) = core.run(future).unwrap();
     process::exit(result.unwrap());
 }
