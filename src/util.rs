@@ -7,7 +7,7 @@ pub struct Pool<T> {
     gets: VecDeque<(usize, oneshot::Sender<Vec<T>>)>,
 }
 
-impl<T> Pool<T> {
+impl<T: 'static> Pool<T> {
     pub fn new() -> Pool<T> {
         Pool { gets: VecDeque::new(), puts: Vec::new() }
     }
@@ -18,11 +18,11 @@ impl<T> Pool<T> {
     }
 
     pub fn get(&mut self, amt: usize)
-        -> impl Future<Item = Vec<T>, Error = ()> {
+        -> Box<Future<Item = Vec<T>, Error = ()>> {
         let (tx, rx) = oneshot::channel();
         self.gets.push_back((amt, tx));
         self.do_marry();
-        rx.map_err(|_| panic!())
+        Box::new(rx.map_err(|_| panic!()))
     }
 
     fn do_marry(&mut self) {

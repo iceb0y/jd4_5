@@ -13,13 +13,9 @@ pub struct SingleFilePackage {
 }
 
 impl SingleFilePackage {
-    pub fn new<P: Into<PathBuf>>(path: P, data: &[u8], perms: Permissions)
+    pub fn new(path: PathBuf, data: Vec<u8>, perms: Permissions)
         -> SingleFilePackage {
-        SingleFilePackage {
-            path: path.into(),
-            data: data.iter().cloned().collect(),
-            perms,
-        }
+        SingleFilePackage { path, data, perms }
     }
 }
 

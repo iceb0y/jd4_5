@@ -10,11 +10,11 @@ use bincode::{self, Infinite};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use futures::{Future, Stream};
 use futures::sink::Sink;
-use nix::fcntl;
-use nix::mount;
-use nix::sched;
+use nix::fcntl::{self, OFlag};
+use nix::mount::{self, MntFlags, MsFlags};
+use nix::sched::{self, CloneFlags};
 use nix::sys::socket;
-use nix::sys::stat::{self, SFlag};
+use nix::sys::stat::{self, Mode, SFlag};
 use nix::sys::wait::{self, WaitStatus};
 use nix::unistd::{self, Uid, Gid};
 use serde::{Serialize, Deserialize};
@@ -58,7 +58,7 @@ enum Request {
 struct ExecuteCommand {
     file: PathBuf,
     args: Vec<String>,
-    env: Vec<String>,
+    envs: Vec<String>,
     open_files: Vec<OpenFile>,
     cgroup_file: Option<PathBuf>,
 }
@@ -79,13 +79,17 @@ enum AccessMode {
 const LENGTH_FIELD_LENGTH: usize = 2;
 const MAX_FRAME_LENGTH: usize = 4096;
 
+pub fn default_envs() -> Vec<String> {
+    vec![String::from("PATH=/usr/bin:/bin"), String::from("HOME=/")]
+}
+
 impl Sandbox {
     // TODO(iceboy): close existing fds
     pub fn new(handle: &Handle) -> Sandbox {
         let (parent_fd, child_fd) = socket::socketpair(
             socket::AddressFamily::Unix,
             socket::SockType::Stream,
-            0,
+            None,
             socket::SockFlag::empty()).unwrap();
         let sandbox_dir = TempDir::new("sandbox").unwrap();
         let in_dir = sandbox_dir.path().join("in");
@@ -121,27 +125,22 @@ impl Sandbox {
     pub fn in_dir(&self) -> PathBuf { self.dir.path().join("in") }
     pub fn out_dir(&self) -> PathBuf { self.dir.path().join("out") }
 
-    pub fn execute<F: Into<PathBuf>>(
+    pub fn execute(
         self,
-        file: F,
-        args: &[&str],
-        env: &[&str],
-        open_files: &[OpenFile],
-    ) -> impl Future<Item = (ExecuteResult, Sandbox), Error = io::Error> {
-        let command = ExecuteCommand {
-            file: file.into(),
-            args: args.iter().map(|&s| s.to_string()).collect(),
-            env: env.iter().map(|&s| s.to_string()).collect(),
-            open_files: open_files.iter().cloned().collect(),
-            cgroup_file: None,
-        };
-        self.call::<ExecuteResult>(Request::Execute(command))
+        file: PathBuf,
+        args: Vec<String>,
+        envs: Vec<String>,
+        open_files: Vec<OpenFile>,
+        cgroup_file: Option<PathBuf>,
+    ) -> Box<Future<Item = (ExecuteResult, Sandbox), Error = io::Error>> {
+        self.call::<ExecuteResult>(Request::Execute(
+            ExecuteCommand { file, args, envs, open_files, cgroup_file }))
     }
 
-    fn call<ResponseT: for<'a> Deserialize<'a>>(self, request: Request)
-        -> impl Future<Item = (ResponseT, Sandbox), Error = io::Error> {
+    fn call<ResponseT: for<'a> Deserialize<'a> + 'static>(self, request: Request)
+        -> Box<Future<Item = (ResponseT, Sandbox), Error = io::Error>> {
         let Sandbox { stream, dir } = self;
-        WriteBincode::new(stream).send(request)
+        let future = WriteBincode::new(stream).send(request)
             .and_then(|sink| {
                 ReadBincode::new(sink.into_inner()).into_future()
                     .map_err(|(err, _)| {
@@ -162,14 +161,14 @@ impl Sandbox {
                             io::ErrorKind::InvalidData, "empty response"))
                     },
                 }
-            })
+            });
+        Box::new(future)
     }
 }
 
 impl OpenFile {
-    pub fn new<F: Into<PathBuf>>(
-        file: F, fds: Vec<RawFd>, mode: OpenMode) -> OpenFile {
-        OpenFile { file: file.into(), fds, mode }
+    pub fn new(file: PathBuf, fds: Vec<RawFd>, mode: OpenMode) -> OpenFile {
+        OpenFile { file, fds, mode }
     }
 }
 
@@ -232,9 +231,9 @@ fn init_sandbox<M: AsRef<Path>>(mount_dir: M, binds: &[Bind]) {
     let host_gid = unistd::getegid();
     let guest_uid = Uid::from_raw(1000);
     let guest_gid = Gid::from_raw(1000);
-    sched::unshare(sched::CLONE_NEWNS | sched::CLONE_NEWUTS |
-                   sched::CLONE_NEWIPC | sched::CLONE_NEWUSER |
-                   sched::CLONE_NEWPID | sched::CLONE_NEWNET).unwrap();
+    sched::unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUTS |
+                   CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_NEWUSER |
+                   CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNET).unwrap();
     write_file("/proc/self/uid_map", &format!("{} {} 1", guest_uid, host_uid));
     write_file("/proc/self/setgroups", "deny");
     write_file("/proc/self/gid_map", &format!("{} {} 1", guest_gid, host_gid));
@@ -256,14 +255,14 @@ fn init_sandbox<M: AsRef<Path>>(mount_dir: M, binds: &[Bind]) {
     mount::mount(Some("sandbox_root"),
                  mount_dir.as_ref(),
                  Some("tmpfs"),
-                 mount::MS_NOSUID,
+                 MsFlags::MS_NOSUID,
                  None as Option<&[u8]>).unwrap();
     env::set_current_dir(&mount_dir).unwrap();
     fs::create_dir("proc").unwrap();
     mount::mount(Some("sandbox_proc"),
                  "proc",
                  Some("proc"),
-                 mount::MS_NOSUID,
+                 MsFlags::MS_NOSUID,
                  None as Option<&[u8]>).unwrap();
     fs::create_dir("dev").unwrap();
     bind_dev("/dev/null", "dev/null");
@@ -272,19 +271,19 @@ fn init_sandbox<M: AsRef<Path>>(mount_dir: M, binds: &[Bind]) {
     mount::mount(Some("sandbox_tmp"),
                  "tmp",
                  Some("tmpfs"),
-                 mount::MS_NOSUID,
+                 MsFlags::MS_NOSUID,
                  Some("size=16m,nr_inodes=4k")).unwrap();
     binds.iter().for_each(bind_or_link);
     write_file("etc/passwd", "icebox:x:1000:1000:icebox:/:/bin/bash\n");
     fs::create_dir("old_root").unwrap();
     unistd::pivot_root(".", "old_root").unwrap();
-    mount::umount2("old_root", mount::MNT_DETACH).unwrap();
+    mount::umount2("old_root", MntFlags::MNT_DETACH).unwrap();
     fs::remove_dir("old_root").unwrap();
     mount::mount(Some("/"),
                  "/",
                  None as Option<&[u8]>,
-                 mount::MS_BIND | mount::MS_REMOUNT | mount::MS_RDONLY |
-                 mount::MS_REC | mount::MS_NOSUID,
+                 MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY |
+                 MsFlags::MS_REC | MsFlags::MS_NOSUID,
                  None as Option<&[u8]>).unwrap();
 }
 
@@ -294,11 +293,11 @@ fn write_file(path: &str, data: &str) {
 
 fn bind_dev(source: &str, target: &str) {
     stat::mknod(
-        target, SFlag::empty(), stat::S_IRUSR | stat::S_IWUSR, 0).unwrap();
+        target, SFlag::empty(), Mode::S_IRUSR | Mode::S_IWUSR, 0).unwrap();
     mount::mount(Some(source),
                  target,
                  None as Option<&[u8]>,
-                 mount::MS_BIND | mount::MS_NOSUID,
+                 MsFlags::MS_BIND | MsFlags::MS_NOSUID,
                  None as Option<&[u8]>).unwrap();
 }
 
@@ -313,15 +312,15 @@ fn bind_or_link(bind: &Bind) {
         mount::mount(Some(&bind.source),
                      &bind.target,
                      None as Option<&[u8]>,
-                     mount::MS_BIND | mount::MS_REC | mount::MS_NOSUID,
+                     MsFlags::MS_BIND | MsFlags::MS_REC | MsFlags::MS_NOSUID,
                      None as Option<&[u8]>).unwrap();
         match bind.mode {
             AccessMode::ReadOnly => mount::mount(
                 Some(&bind.source),
                 &bind.target,
                 None as Option<&[u8]>,
-                mount::MS_BIND | mount::MS_REMOUNT | mount::MS_RDONLY |
-                mount::MS_REC | mount::MS_NOSUID,
+                MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY |
+                MsFlags::MS_REC | MsFlags::MS_NOSUID,
                 None as Option<&[u8]>).unwrap(),
             _ => (),
         }
@@ -350,8 +349,8 @@ fn do_execute(
             unistd::close(socket_fd).unwrap();
             for OpenFile { file, fds, mode } in command.open_files {
                 let flag = match mode {
-                    OpenMode::ReadOnly => fcntl::O_RDONLY,
-                    OpenMode::WriteOnly => fcntl::O_WRONLY,
+                    OpenMode::ReadOnly => OFlag::O_RDONLY,
+                    OpenMode::WriteOnly => OFlag::O_WRONLY,
                 };
                 let source_fd =
                     fcntl::open(&file, flag, stat::Mode::empty()).unwrap();
@@ -367,10 +366,10 @@ fn do_execute(
             let args: Vec<_> = command.args.into_iter()
                 .map(|arg| CString::new(arg).unwrap())
                 .collect();
-            let env: Vec<_> = command.env.into_iter()
+            let envs: Vec<_> = command.envs.into_iter()
                 .map(|arg| CString::new(arg).unwrap())
                 .collect();
-            unistd::execve(&file, &args, &env).unwrap();
+            unistd::execve(&file, &args, &envs).unwrap();
             panic!();
         },
     };
@@ -397,10 +396,12 @@ mod tests {
         let stdout_path = sandbox.out_dir().join("stdout");
         File::create(&stdout_path).unwrap();
         let future = sandbox.execute(
-            "/usr/bin/whoami",
-            &["whoami"],
-            &["PATH=/usr/bin:/bin", "HOME=/"],
-            &[OpenFile::new("/out/stdout", vec![1], OpenMode::WriteOnly)]);
+            PathBuf::from("/usr/bin/whoami"),
+            vec![String::from("whoami")],
+            default_envs(),
+            vec![OpenFile::new(PathBuf::from("/out/stdout"),
+                               vec![1], OpenMode::WriteOnly)],
+            None);
         let (result, sandbox) = core.run(future).unwrap();
         assert_eq!(result.unwrap(), 0);
         let mut data = String::new();
@@ -414,10 +415,12 @@ mod tests {
         let mut core = Core::new().unwrap();
         let sandbox = Sandbox::new(&core.handle());
         let future = sandbox.execute(
-            "/usr/bin/touch",
-            &["touch", "/bin/dummy"],
-            &["PATH=/usr/bin:/bin", "HOME=/"],
-            &[OpenFile::new("/dev/null", vec![2], OpenMode::WriteOnly)]);
+            PathBuf::from("/usr/bin/touch"),
+            vec![String::from("touch"), String::from("/bin/dummy")],
+            default_envs(),
+            vec![OpenFile::new(PathBuf::from("/dev/null"),
+                               vec![2], OpenMode::WriteOnly)],
+            None);
         let (result, _) = core.run(future).unwrap();
         assert_ne!(result.unwrap(), 0);
     }
