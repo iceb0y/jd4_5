@@ -74,9 +74,9 @@ pub fn run(
         .and_then(move |mut sandboxes| {
             let user_sandbox = sandboxes.pop().unwrap();
             user_target.install(&user_sandbox.in_dir());
-            unistd::mkfifo(&user_sandbox.in_dir().join("stdout"), Mode::S_IWUSR).unwrap();
             let judge_sandbox = sandboxes.pop().unwrap();
             judge_target.install(&judge_sandbox.in_dir());
+            unistd::mkfifo(&user_sandbox.in_dir().join("stdout"), Mode::S_IWUSR).unwrap();
             fs::hard_link(
                 &user_sandbox.in_dir().join("stdout"),
                 &judge_sandbox.in_dir().join("extra")).unwrap();

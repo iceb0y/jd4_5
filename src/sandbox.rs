@@ -6,7 +6,7 @@ use std::os::unix;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process;
-use bincode::{self, Infinite};
+use bincode;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use futures::{Future, Stream};
 use futures::sink::Sink;
@@ -202,11 +202,7 @@ impl Bind {
     }
 }
 
-fn do_child<M: AsRef<Path>>(
-    mount_dir: M,
-    binds: &[Bind],
-    child_fd: RawFd
-) -> ! {
+fn do_child(mount_dir: &Path, binds: &[Bind], child_fd: RawFd) -> ! {
     init_sandbox(mount_dir, binds);
     let mut stream = unsafe { unix::net::UnixStream::from_raw_fd(child_fd) };
     let mut buffer = [0; MAX_FRAME_LENGTH];
@@ -226,7 +222,7 @@ fn do_child<M: AsRef<Path>>(
     }
 }
 
-fn init_sandbox<M: AsRef<Path>>(mount_dir: M, binds: &[Bind]) {
+fn init_sandbox(mount_dir: &Path, binds: &[Bind]) {
     let host_uid = unistd::geteuid();
     let host_gid = unistd::getegid();
     let guest_uid = Uid::from_raw(1000);
@@ -253,11 +249,11 @@ fn init_sandbox<M: AsRef<Path>>(mount_dir: M, binds: &[Bind]) {
         unistd::ForkResult::Child => (),
     }
     mount::mount(Some("sandbox_root"),
-                 mount_dir.as_ref(),
+                 mount_dir,
                  Some("tmpfs"),
                  MsFlags::MS_NOSUID,
                  None as Option<&[u8]>).unwrap();
-    env::set_current_dir(&mount_dir).unwrap();
+    env::set_current_dir(mount_dir).unwrap();
     fs::create_dir("proc").unwrap();
     mount::mount(Some("sandbox_proc"),
                  "proc",
@@ -378,10 +374,10 @@ fn do_execute(
 
 fn write_response<ResponseT: Serialize>(
     stream: &mut unix::net::UnixStream, response: &ResponseT) {
-    let size = bincode::serialized_size(response) as usize;
+    let size = bincode::serialized_size(response).unwrap() as usize;
     assert!(size <= MAX_FRAME_LENGTH);
     stream.write_u16::<LittleEndian>(size as u16).unwrap();
-    bincode::serialize_into(stream, response, Infinite).unwrap();
+    bincode::serialize_into(stream, response).unwrap();
 }
 
 #[cfg(test)]
