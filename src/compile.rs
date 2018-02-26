@@ -11,7 +11,7 @@ use sandbox::{self, OpenFile, OpenMode, Sandbox};
 use util::Pool;
 
 pub trait Compiler {
-    fn package(&self, source: Vec<u8>) -> Box<Package>;
+    fn package(&self, source: Box<[u8]>) -> Box<Package>;
     fn compile(&self, source: Box<Package>, pool: &Arc<Mutex<Pool<Sandbox>>>)
         -> Box<Future<Item = Box<Package>, Error = io::Error>>;
 }
@@ -19,14 +19,14 @@ pub trait Compiler {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct BinaryCompiler {
     compiler_file: PathBuf,
-    compiler_args: Vec<String>,
+    compiler_args: Box<[String]>,
     code_file: PathBuf,
     execute_file: PathBuf,
-    execute_args: Vec<String>,
+    execute_args: Box<[String]>,
 }
 
 impl Compiler for BinaryCompiler {
-    fn package(&self, source: Vec<u8>) -> Box<Package> {
+    fn package(&self, source: Box<[u8]>) -> Box<Package> {
         let package = SingleFilePackage::new(
             self.code_file.clone(), source, Permissions::from_mode(0o600));
         Box::new(package)
@@ -44,7 +44,7 @@ impl Compiler for BinaryCompiler {
                 source.install(&sandbox.in_dir());
                 // TODO(iceboy): stdin, stdout, stderr, cgroup
                 sandbox.execute(compiler_file, compiler_args,
-                                sandbox::default_envs(), vec![], None)
+                                sandbox::default_envs(), Box::new([]), None)
             })
             .and_then(move |(result, sandbox)| -> Result<Box<Package>, _> {
                 // TODO(iceboy): Error handling.
@@ -54,7 +54,8 @@ impl Compiler for BinaryCompiler {
                 let mut data = Vec::new();
                 foo.read_to_end(&mut data).unwrap();
                 let package = SingleFilePackage::new(
-                    target_file, data, foo.metadata().unwrap().permissions());
+                    target_file, data.into_boxed_slice(),
+                    foo.metadata().unwrap().permissions());
                 // TODO(iceboy): Cleanup sandbox.
                 pool_clone.lock().unwrap().put(sandbox);
                 Ok(Box::new(package))
@@ -82,15 +83,15 @@ pub fn run(
                 &judge_sandbox.in_dir().join("extra")).unwrap();
             user_sandbox.execute(
                 PathBuf::from("/in/foo"),
-                vec![String::from("foo")],
+                Box::new([String::from("foo")]),
                 sandbox::default_envs(),
-                vec![OpenFile::new(PathBuf::from("/in/stdout"), vec![1], OpenMode::WriteOnly)],
+                Box::new([OpenFile::new(PathBuf::from("/in/stdout"), Box::new([1]), OpenMode::WriteOnly)]),
                 None,
             ).join(judge_sandbox.execute(
                 PathBuf::from("/in/foo"),
-                vec![String::from("foo")],
+                Box::new([String::from("foo")]),
                 sandbox::default_envs(),
-                vec![OpenFile::new(PathBuf::from("/in/extra"), vec![3], OpenMode::ReadOnly)],
+                Box::new([OpenFile::new(PathBuf::from("/in/extra"), Box::new([3]), OpenMode::ReadOnly)]),
                 None,
             ))
         })

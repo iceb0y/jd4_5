@@ -13,9 +13,9 @@ fn main() {
     let sandbox = Sandbox::new(&core.handle());
     let future = sandbox.execute(
         PathBuf::from("/bin/bash"),
-        vec![String::from("bunny")],
+        Box::new([String::from("bunny")]),
         sandbox::default_envs(),
-        vec![],
+        Box::new([]),
         None);
     let (result, _) = core.run(future).unwrap();
     process::exit(result.unwrap());

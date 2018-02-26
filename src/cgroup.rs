@@ -43,7 +43,7 @@ impl CGroup {
         Ok(())
     }
 
-    pub fn procs(&self) -> io::Result<Vec<Pid>> {
+    pub fn procs(&self) -> io::Result<Box<[Pid]>> {
         let mut pids = Vec::new();
         for &dir in &[&self.cpuacct_dir, &self.memory_dir, &self.pids_dir] {
             for line in dir.read("cgroup.procs")?.lines() {
@@ -53,7 +53,7 @@ impl CGroup {
             }
         }
         pids.dedup();
-        Ok(pids)
+        Ok(pids.into_boxed_slice())
     }
 }
 

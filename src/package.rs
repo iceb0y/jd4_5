@@ -8,12 +8,12 @@ pub trait Package {
 
 pub struct SingleFilePackage {
     path: PathBuf,
-    data: Vec<u8>,
+    data: Box<[u8]>,
     perms: Permissions,
 }
 
 impl SingleFilePackage {
-    pub fn new(path: PathBuf, data: Vec<u8>, perms: Permissions)
+    pub fn new(path: PathBuf, data: Box<[u8]>, perms: Permissions)
         -> SingleFilePackage {
         SingleFilePackage { path, data, perms }
     }

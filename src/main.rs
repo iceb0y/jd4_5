@@ -17,12 +17,12 @@ compiler_args: ["gcc", "-static", "-O2", "-std=c99", "-o", "/out/foo", "/in/foo.
 code_file: "foo.c"
 execute_file: "foo"
 execute_args: ["foo"]"#).unwrap();
-    let user_source = gcc.package(br#"#include <stdio.h>
+    let user_source = gcc.package(Box::new(*br#"#include <stdio.h>
 
 int main(void) {
     printf("42\n");
-}"#.to_vec());
-    let judge_source = gcc.package(br#"#include <stdio.h>
+}"#));
+    let judge_source = gcc.package(Box::new(*br#"#include <stdio.h>
 
 int main(void) {
     FILE *fp = fdopen(3, "r");
@@ -37,7 +37,7 @@ int main(void) {
     }
     printf("a = %d\n", a);
     return 0;
-}"#.to_vec());
+}"#));
     let mut core = Core::new().unwrap();
     let mut pool_mut = Pool::new();
     pool_mut.put(Sandbox::new(&core.handle()));

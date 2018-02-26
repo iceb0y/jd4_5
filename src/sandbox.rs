@@ -39,7 +39,7 @@ pub enum ExecuteError {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct OpenFile {
     file: PathBuf,
-    fds: Vec<RawFd>,
+    fds: Box<[RawFd]>,
     mode: OpenMode,
 }
 
@@ -57,9 +57,9 @@ enum Request {
 #[derive(Serialize, Deserialize)]
 struct ExecuteCommand {
     file: PathBuf,
-    args: Vec<String>,
-    envs: Vec<String>,
-    open_files: Vec<OpenFile>,
+    args: Box<[String]>,
+    envs: Box<[String]>,
+    open_files: Box<[OpenFile]>,
     cgroup_file: Option<PathBuf>,
 }
 
@@ -79,8 +79,8 @@ enum AccessMode {
 const LENGTH_FIELD_LENGTH: usize = 2;
 const MAX_FRAME_LENGTH: usize = 4096;
 
-pub fn default_envs() -> Vec<String> {
-    vec![String::from("PATH=/usr/bin:/bin"), String::from("HOME=/")]
+pub fn default_envs() -> Box<[String]> {
+    Box::new([String::from("PATH=/usr/bin:/bin"), String::from("HOME=/")])
 }
 
 impl Sandbox {
@@ -98,7 +98,7 @@ impl Sandbox {
         fs::create_dir(&out_dir).unwrap();
         let mount_dir = sandbox_dir.path().join("mount");
         fs::create_dir(&mount_dir).unwrap();
-        let mut binds = Bind::defaults();
+        let mut binds = Bind::defaults().into_vec();
         binds.push(Bind::new(&in_dir, "in", AccessMode::ReadOnly));
         binds.push(Bind::new(&out_dir, "out", AccessMode::ReadWrite));
         match unistd::fork().unwrap() {
@@ -128,9 +128,9 @@ impl Sandbox {
     pub fn execute(
         self,
         file: PathBuf,
-        args: Vec<String>,
-        envs: Vec<String>,
-        open_files: Vec<OpenFile>,
+        args: Box<[String]>,
+        envs: Box<[String]>,
+        open_files: Box<[OpenFile]>,
         cgroup_file: Option<PathBuf>,
     ) -> Box<Future<Item = (ExecuteResult, Sandbox), Error = io::Error>> {
         self.call::<ExecuteResult>(Request::Execute(
@@ -167,7 +167,7 @@ impl Sandbox {
 }
 
 impl OpenFile {
-    pub fn new(file: PathBuf, fds: Vec<RawFd>, mode: OpenMode) -> OpenFile {
+    pub fn new(file: PathBuf, fds: Box<[RawFd]>, mode: OpenMode) -> OpenFile {
         OpenFile { file, fds, mode }
     }
 }
@@ -185,8 +185,8 @@ impl Bind {
         Bind { source, target, mode }
     }
 
-    fn defaults() -> Vec<Bind> {
-        vec![
+    fn defaults() -> Box<[Bind]> {
+        Box::new([
             Bind::new("/bin", "bin", AccessMode::ReadOnly),
             Bind::new("/etc/alternatives", "etc/alternatives", AccessMode::ReadOnly),
             Bind::new("/lib", "lib", AccessMode::ReadOnly),
@@ -198,7 +198,7 @@ impl Bind {
             Bind::new("/usr/libexec", "usr/libexec", AccessMode::ReadOnly),
             Bind::new("/usr/share", "usr/share", AccessMode::ReadOnly),
             Bind::new("/var/lib/ghc", "var/lib/ghc", AccessMode::ReadOnly),
-        ]
+        ])
     }
 }
 
@@ -329,7 +329,7 @@ fn bind_or_link(bind: &Bind) {
 fn do_execute(
     socket_fd: RawFd,
     command: ExecuteCommand,
-    stream: &mut unix::net::UnixStream
+    stream: &mut unix::net::UnixStream,
 ) {
     // TODO(iceboy): Reap zombies?
     let response: ExecuteResult = match unistd::fork().unwrap() {
@@ -343,27 +343,27 @@ fn do_execute(
         },
         unistd::ForkResult::Child => {
             unistd::close(socket_fd).unwrap();
-            for OpenFile { file, fds, mode } in command.open_files {
-                let flag = match mode {
+            for open_file in command.open_files.into_iter() {
+                let flag = match open_file.mode {
                     OpenMode::ReadOnly => OFlag::O_RDONLY,
                     OpenMode::WriteOnly => OFlag::O_WRONLY,
                 };
-                let source_fd =
-                    fcntl::open(&file, flag, stat::Mode::empty()).unwrap();
-                for &target_fd in &fds {
+                let source_fd = fcntl::open(
+                    &open_file.file, flag, stat::Mode::empty()).unwrap();
+                for &target_fd in open_file.fds.iter() {
                     unistd::dup2(source_fd, target_fd).unwrap();
                 }
-                if fds.iter().any(|&fd| fd == source_fd) {
+                if open_file.fds.iter().any(|&fd| fd == source_fd) {
                     unistd::close(source_fd).unwrap();
                 }
             }
             let file = CString::new(
                 command.file.as_os_str().to_str().unwrap()).unwrap();
             let args: Vec<_> = command.args.into_iter()
-                .map(|arg| CString::new(arg).unwrap())
+                .map(|arg| CString::new(arg.as_str()).unwrap())
                 .collect();
-            let envs: Vec<_> = command.envs.into_iter()
-                .map(|arg| CString::new(arg).unwrap())
+            let envs: Vec<_> = command.envs.iter()
+                .map(|arg| CString::new(arg.as_str()).unwrap())
                 .collect();
             unistd::execve(&file, &args, &envs).unwrap();
             panic!();
@@ -393,10 +393,10 @@ mod tests {
         File::create(&stdout_path).unwrap();
         let future = sandbox.execute(
             PathBuf::from("/usr/bin/whoami"),
-            vec![String::from("whoami")],
+            Box::new([String::from("whoami")]),
             default_envs(),
-            vec![OpenFile::new(PathBuf::from("/out/stdout"),
-                               vec![1], OpenMode::WriteOnly)],
+            Box::new([OpenFile::new(PathBuf::from("/out/stdout"),
+                                    Box::new([1]), OpenMode::WriteOnly)]),
             None);
         let (result, sandbox) = core.run(future).unwrap();
         assert_eq!(result.unwrap(), 0);
@@ -412,10 +412,10 @@ mod tests {
         let sandbox = Sandbox::new(&core.handle());
         let future = sandbox.execute(
             PathBuf::from("/usr/bin/touch"),
-            vec![String::from("touch"), String::from("/bin/dummy")],
+            Box::new([String::from("touch"), String::from("/bin/dummy")]),
             default_envs(),
-            vec![OpenFile::new(PathBuf::from("/dev/null"),
-                               vec![2], OpenMode::WriteOnly)],
+            Box::new([OpenFile::new(PathBuf::from("/dev/null"),
+                                    Box::new([2]), OpenMode::WriteOnly)]),
             None);
         let (result, _) = core.run(future).unwrap();
         assert_ne!(result.unwrap(), 0);
