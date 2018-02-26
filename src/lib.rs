@@ -12,7 +12,9 @@ extern crate tokio_core;
 extern crate tokio_io;
 extern crate tokio_serde_bincode;
 extern crate tokio_uds;
+extern crate zip;
 
+pub mod case;
 pub mod cgroup;
 pub mod compile;
 pub mod package;

@@ -17,3 +17,4 @@ tokio-core = "0.1.12"
 tokio-io = "0.1.5"
 tokio-serde-bincode = { git = "https://github.com/alexcrichton/tokio-serde-bincode.git" }
 tokio-uds = "0.1.7"
+zip = "0.3.1"
