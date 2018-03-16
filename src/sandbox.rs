@@ -1,15 +1,13 @@
 use std::env;
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::unix;
+use std::os::unix::net::UnixStream;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process;
 use bincode;
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use futures::{Future, Stream};
-use futures::sink::Sink;
 use nix::fcntl::{self, OFlag};
 use nix::mount::{self, MntFlags, MsFlags};
 use nix::sched::{self, CloneFlags};
@@ -17,15 +15,10 @@ use nix::sys::socket;
 use nix::sys::stat::{self, Mode, SFlag};
 use nix::sys::wait::{self, WaitStatus};
 use nix::unistd::{self, Uid, Gid};
-use serde::{Serialize, Deserialize};
 use tempdir::TempDir;
-use tokio_core::reactor::Handle;
-use tokio_io::codec::length_delimited::{self, Framed};
-use tokio_serde_bincode::{ReadBincode, WriteBincode};
-use tokio_uds;
 
 pub struct Sandbox {
-    stream: Framed<tokio_uds::UnixStream>,
+    stream: UnixStream,
     dir: TempDir,
 }
 
@@ -36,14 +29,14 @@ pub enum ExecuteError {
     Signaled(i32),
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct OpenFile {
     file: PathBuf,
     fds: Box<[RawFd]>,
     mode: OpenMode,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum OpenMode {
     ReadOnly,
     WriteOnly,
@@ -76,16 +69,13 @@ enum AccessMode {
     ReadWrite,
 }
 
-const LENGTH_FIELD_LENGTH: usize = 2;
-const MAX_FRAME_LENGTH: usize = 4096;
-
 pub fn default_envs() -> Box<[String]> {
     Box::new([String::from("PATH=/usr/bin:/bin"), String::from("HOME=/")])
 }
 
 impl Sandbox {
     // TODO(iceboy): close existing fds
-    pub fn new(handle: &Handle) -> Sandbox {
+    pub fn new() -> Sandbox {
         let (parent_fd, child_fd) = socket::socketpair(
             socket::AddressFamily::Unix,
             socket::SockType::Stream,
@@ -99,8 +89,10 @@ impl Sandbox {
         let mount_dir = sandbox_dir.path().join("mount");
         fs::create_dir(&mount_dir).unwrap();
         let mut binds = Bind::defaults().into_vec();
-        binds.push(Bind::new(&in_dir, "in", AccessMode::ReadOnly));
-        binds.push(Bind::new(&out_dir, "out", AccessMode::ReadWrite));
+        binds.push(
+            Bind::new(in_dir, PathBuf::from("in"), AccessMode::ReadOnly));
+        binds.push(
+            Bind::new(out_dir, PathBuf::from("out"), AccessMode::ReadWrite));
         match unistd::fork().unwrap() {
             unistd::ForkResult::Parent { .. } => {
                 unistd::close(child_fd).unwrap();
@@ -110,59 +102,27 @@ impl Sandbox {
                 do_child(&mount_dir, &binds, child_fd);
             },
         };
-        let net_stream =
-            unsafe { unix::net::UnixStream::from_raw_fd(parent_fd) };
-        let async_stream = tokio_uds::UnixStream::from_stream(
-            net_stream, handle).unwrap();
-        let framed_stream = length_delimited::Builder::new()
-            .little_endian()
-            .length_field_length(LENGTH_FIELD_LENGTH)
-            .max_frame_length(MAX_FRAME_LENGTH)
-            .new_framed(async_stream);
-        Sandbox { stream: framed_stream, dir: sandbox_dir }
+        Sandbox {
+            stream: unsafe { UnixStream::from_raw_fd(parent_fd) },
+            dir: sandbox_dir,
+        }
     }
 
     pub fn in_dir(&self) -> PathBuf { self.dir.path().join("in") }
     pub fn out_dir(&self) -> PathBuf { self.dir.path().join("out") }
 
     pub fn execute(
-        self,
+        &mut self,
         file: PathBuf,
         args: Box<[String]>,
         envs: Box<[String]>,
         open_files: Box<[OpenFile]>,
         cgroup_file: Option<PathBuf>,
-    ) -> Box<Future<Item = (ExecuteResult, Sandbox), Error = io::Error>> {
-        self.call::<ExecuteResult>(Request::Execute(
+    ) -> ExecuteResult {
+        bincode::serialize_into(&mut self.stream, &Request::Execute(
             ExecuteCommand { file, args, envs, open_files, cgroup_file }))
-    }
-
-    fn call<ResponseT: for<'a> Deserialize<'a> + 'static>(self, request: Request)
-        -> Box<Future<Item = (ResponseT, Sandbox), Error = io::Error>> {
-        let Sandbox { stream, dir } = self;
-        let future = WriteBincode::new(stream).send(request)
-            .and_then(|sink| {
-                ReadBincode::new(sink.into_inner()).into_future()
-                    .map_err(|(err, _)| {
-                        io::Error::new(io::ErrorKind::InvalidData, err)
-                    })
-            })
-            .and_then(|(maybe_response, source)| {
-                match maybe_response {
-                    Some(response) => {
-                        let sandbox = Sandbox {
-                            stream: source.into_inner(),
-                            dir: dir,
-                        };
-                        Ok((response, sandbox))
-                    },
-                    None => {
-                        Err(io::Error::new(
-                            io::ErrorKind::InvalidData, "empty response"))
-                    },
-                }
-            });
-        Box::new(future)
+            .unwrap();
+        bincode::deserialize_from(&mut self.stream).unwrap()
     }
 }
 
@@ -173,51 +133,42 @@ impl OpenFile {
 }
 
 impl Bind {
-    fn new<S: Into<PathBuf>, T: Into<PathBuf>>(
-        source: S,
-        target: T,
-        mode: AccessMode
-    ) -> Bind {
-        let source = source.into();
-        let target = target.into();
+    fn new(source: PathBuf, target: PathBuf, mode: AccessMode) -> Bind {
         assert!(source.is_absolute());
         assert!(target.is_relative());
         Bind { source, target, mode }
     }
 
     fn defaults() -> Box<[Bind]> {
+        fn ro(source: &str, target: &str) -> Bind {
+            Bind::new(
+                PathBuf::from(source),
+                PathBuf::from(target),
+                AccessMode::ReadOnly)
+        }
         Box::new([
-            Bind::new("/bin", "bin", AccessMode::ReadOnly),
-            Bind::new("/etc/alternatives", "etc/alternatives", AccessMode::ReadOnly),
-            Bind::new("/lib", "lib", AccessMode::ReadOnly),
-            Bind::new("/lib64", "lib64", AccessMode::ReadOnly),
-            Bind::new("/usr/bin", "usr/bin", AccessMode::ReadOnly),
-            Bind::new("/usr/include", "usr/include", AccessMode::ReadOnly),
-            Bind::new("/usr/lib", "usr/lib", AccessMode::ReadOnly),
-            Bind::new("/usr/lib64", "usr/lib64", AccessMode::ReadOnly),
-            Bind::new("/usr/libexec", "usr/libexec", AccessMode::ReadOnly),
-            Bind::new("/usr/share", "usr/share", AccessMode::ReadOnly),
-            Bind::new("/var/lib/ghc", "var/lib/ghc", AccessMode::ReadOnly),
+            ro("/bin", "bin"),
+            ro("/etc/alternatives", "etc/alternatives"),
+            ro("/lib", "lib"),
+            ro("/lib64", "lib64"),
+            ro("/usr/bin", "usr/bin"),
+            ro("/usr/include", "usr/include"),
+            ro("/usr/lib", "usr/lib"),
+            ro("/usr/lib64", "usr/lib64"),
+            ro("/usr/libexec", "usr/libexec"),
+            ro("/usr/share", "usr/share"),
+            ro("/var/lib/ghc", "var/lib/ghc"),
         ])
     }
 }
 
 fn do_child(mount_dir: &Path, binds: &[Bind], child_fd: RawFd) -> ! {
     init_sandbox(mount_dir, binds);
-    let mut stream = unsafe { unix::net::UnixStream::from_raw_fd(child_fd) };
-    let mut buffer = [0; MAX_FRAME_LENGTH];
+    let mut stream = unsafe { UnixStream::from_raw_fd(child_fd) };
     loop {
-        let size = match stream.read_u16::<LittleEndian>() {
-            Ok(size) => size as usize,
-            Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof =>
-                process::exit(0),
-            Err(e) => panic!("{:?}", e),
-        };
-        assert!(size <= MAX_FRAME_LENGTH);
-        stream.read_exact(&mut buffer[..size]).unwrap();
-        match bincode::deserialize(&buffer[..size]).unwrap() {
-            Request::Execute(command) =>
-                do_execute(child_fd, command, &mut stream),
+        match bincode::deserialize_from(&mut stream).unwrap() {
+            Request::Execute(command) => bincode::serialize_into(
+                &mut stream, &do_execute(child_fd, command)).unwrap(),
         };
     }
 }
@@ -326,13 +277,9 @@ fn bind_or_link(bind: &Bind) {
     }
 }
 
-fn do_execute(
-    socket_fd: RawFd,
-    command: ExecuteCommand,
-    stream: &mut unix::net::UnixStream,
-) {
+fn do_execute(socket_fd: RawFd, command: ExecuteCommand) -> ExecuteResult {
     // TODO(iceboy): Reap zombies?
-    let response: ExecuteResult = match unistd::fork().unwrap() {
+    match unistd::fork().unwrap() {
         unistd::ForkResult::Parent { child } => {
             match wait::waitpid(child, None).unwrap() {
                 WaitStatus::Exited(_, status) => Ok(status as i32),
@@ -368,38 +315,27 @@ fn do_execute(
             unistd::execve(&file, &args, &envs).unwrap();
             panic!();
         },
-    };
-    write_response(stream, &response);
-}
-
-fn write_response<ResponseT: Serialize>(
-    stream: &mut unix::net::UnixStream, response: &ResponseT) {
-    let size = bincode::serialized_size(response).unwrap() as usize;
-    assert!(size <= MAX_FRAME_LENGTH);
-    stream.write_u16::<LittleEndian>(size as u16).unwrap();
-    bincode::serialize_into(stream, response).unwrap();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio_core::reactor::Core;
+    use std::io::Read;
 
     #[test]
     fn whoami() {
-        let mut core = Core::new().unwrap();
-        let sandbox = Sandbox::new(&core.handle());
+        let mut sandbox = Sandbox::new();
         let stdout_path = sandbox.out_dir().join("stdout");
         File::create(&stdout_path).unwrap();
-        let future = sandbox.execute(
+        let status = sandbox.execute(
             PathBuf::from("/usr/bin/whoami"),
             Box::new([String::from("whoami")]),
             default_envs(),
             Box::new([OpenFile::new(PathBuf::from("/out/stdout"),
                                     Box::new([1]), OpenMode::WriteOnly)]),
-            None);
-        let (result, sandbox) = core.run(future).unwrap();
-        assert_eq!(result.unwrap(), 0);
+            None).unwrap();
+        assert_eq!(status, 0);
         let mut data = String::new();
         File::open(&stdout_path).unwrap().read_to_string(&mut data).unwrap();
         assert_eq!(data, "icebox\n");
@@ -408,16 +344,14 @@ mod tests {
 
     #[test]
     fn read_only() {
-        let mut core = Core::new().unwrap();
-        let sandbox = Sandbox::new(&core.handle());
-        let future = sandbox.execute(
+        let mut sandbox = Sandbox::new();
+        let status = sandbox.execute(
             PathBuf::from("/usr/bin/touch"),
             Box::new([String::from("touch"), String::from("/bin/dummy")]),
             default_envs(),
             Box::new([OpenFile::new(PathBuf::from("/dev/null"),
                                     Box::new([2]), OpenMode::WriteOnly)]),
-            None);
-        let (result, _) = core.run(future).unwrap();
-        assert_ne!(result.unwrap(), 0);
+            None).unwrap();
+        assert_ne!(status, 0);
     }
 }

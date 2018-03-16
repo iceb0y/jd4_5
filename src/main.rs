@@ -1,11 +1,6 @@
 extern crate jd4_5;
-extern crate futures;
 extern crate serde_yaml;
-extern crate tokio_core;
 
-use std::sync::{Arc, Mutex};
-use futures::Future;
-use tokio_core::reactor::Core;
 use jd4_5::compile::{self, Compiler, BinaryCompiler};
 use jd4_5::sandbox::Sandbox;
 use jd4_5::util::Pool;
@@ -22,7 +17,8 @@ execute_args: ["foo"]"#).unwrap();
 int main(void) {
     printf("42\n");
 }"#));
-    let judge_source = gcc.package(Box::new(*br#"#include <stdio.h>
+    let judge_source = gcc.package(Box::new(*br#"#define _POSIX_C_SOURCE 1
+#include <stdio.h>
 
 int main(void) {
     FILE *fp = fdopen(3, "r");
@@ -38,14 +34,11 @@ int main(void) {
     printf("a = %d\n", a);
     return 0;
 }"#));
-    let mut core = Core::new().unwrap();
-    let mut pool_mut = Pool::new();
-    pool_mut.put(Sandbox::new(&core.handle()));
-    pool_mut.put(Sandbox::new(&core.handle()));
-    let pool = Arc::new(Mutex::new(pool_mut));
-    let future = gcc.compile(user_source, &pool)
-        .join(gcc.compile(judge_source, &pool))
-        .and_then(|(user_target, judge_target)|
-            compile::run(user_target, judge_target, &pool));
-    core.run(future).unwrap();
+    let pool = Pool::new();
+    pool.put(Sandbox::new());
+    pool.put(Sandbox::new());
+    // These two can be parallelized...
+    let user_target = gcc.compile(user_source, &pool);
+    let judge_target = gcc.compile(judge_source, &pool);
+    compile::run(user_target, judge_target, &pool);
 }

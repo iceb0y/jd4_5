@@ -5,16 +5,10 @@ authors = ["iceboy"]
 
 [dependencies]
 bincode = "1.0.0"
-byteorder = "1.2.1"
-futures = "0.1.18"
 nix = "0.10.0"
 rand = "0.4.2"
 serde = "1.0.27"
 serde_derive = "1.0.27"
 serde_yaml = "0.7.3"
 tempdir = "0.3.6"
-tokio-core = "0.1.12"
-tokio-io = "0.1.5"
-tokio-serde-bincode = { git = "https://github.com/alexcrichton/tokio-serde-bincode.git" }
-tokio-uds = "0.1.7"
 zip = "0.3.1"
