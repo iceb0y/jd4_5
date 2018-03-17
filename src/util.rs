@@ -30,8 +30,6 @@ impl<T> Pool<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    //use std::cell::RefCell;
-    //use std::sync::Arc;
 
     #[test]
     fn pool_one() {

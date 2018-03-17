@@ -7,6 +7,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::{Arc, Condvar, Mutex};
 use bincode;
 use nix::fcntl::{self, OFlag};
 use nix::mount::{self, MntFlags, MsFlags};
@@ -29,18 +30,14 @@ pub enum ExecuteError {
     Signaled(i32),
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct OpenFile {
-    file: PathBuf,
-    fds: Box<[RawFd]>,
-    mode: OpenMode,
+pub struct Pipe(Arc<PipeState>);
+
+pub struct PipeState {
+    path: Mutex<Option<PathBuf>>,
+    condvar: Condvar,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub enum OpenMode {
-    ReadOnly,
-    WriteOnly,
-}
+pub struct Port(String, RawFd, OpenMode);
 
 #[derive(Serialize, Deserialize)]
 enum Request {
@@ -54,6 +51,19 @@ struct ExecuteCommand {
     envs: Box<[String]>,
     open_files: Box<[OpenFile]>,
     cgroup_file: Option<PathBuf>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct OpenFile {
+    file: PathBuf,
+    fds: Box<[RawFd]>,
+    mode: OpenMode,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+enum OpenMode {
+    ReadOnly,
+    WriteOnly,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -116,9 +126,18 @@ impl Sandbox {
         file: PathBuf,
         args: Box<[String]>,
         envs: Box<[String]>,
-        open_files: Box<[OpenFile]>,
+        pipes: Box<[(Pipe, Port)]>,
         cgroup_file: Option<PathBuf>,
     ) -> ExecuteResult {
+        let open_files = pipes.into_vec().into_iter().map(|(pipe, port)| {
+            let Port(name, fd, mode) = port;
+            pipe.into_fifo(&self.in_dir().join(&name));
+            OpenFile {
+                file: PathBuf::from("/in").join(&name),
+                fds: Box::new([fd]),
+                mode,
+            }
+        }).collect::<Vec<_>>().into_boxed_slice();
         bincode::serialize_into(&mut self.stream, &Request::Execute(
             ExecuteCommand { file, args, envs, open_files, cgroup_file }))
             .unwrap();
@@ -126,9 +145,57 @@ impl Sandbox {
     }
 }
 
-impl OpenFile {
-    pub fn new(file: PathBuf, fds: Box<[RawFd]>, mode: OpenMode) -> OpenFile {
-        OpenFile { file, fds, mode }
+impl Pipe {
+    pub fn new() -> (Pipe, Pipe) {
+        let state = Arc::new(PipeState {
+            path: Mutex::new(None),
+            condvar: Condvar::new(),
+        });
+        (Pipe(state.clone()), Pipe(state))
+    }
+
+    pub fn into_fifo(self, path: &Path) {
+        let mut maybe_path = self.0.path.lock().unwrap();
+        match maybe_path.clone() {
+            Some(existing_path) => {
+                fs::hard_link(existing_path, path).unwrap();
+            },
+            None => {
+                unistd::mkfifo(path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+                *maybe_path = Some(path.to_path_buf());
+                self.0.condvar.notify_all();
+            },
+        }
+    }
+
+    pub fn into_reader(self) -> File {
+        let mut maybe_path = self.0.path.lock().unwrap();
+        while maybe_path.is_none() {
+            maybe_path = self.0.condvar.wait(maybe_path).unwrap();
+        }
+        File::open(maybe_path.as_ref().unwrap()).unwrap()
+    }
+
+    /*pub fn into_writer(self) -> File {
+
+    }*/
+}
+
+impl Port {
+    pub fn stdin() -> Port {
+        Port(String::from("stdin"), 0, OpenMode::ReadOnly)
+    }
+
+    pub fn stdout() -> Port {
+        Port(String::from("stdout"), 1, OpenMode::WriteOnly)
+    }
+
+    pub fn stderr() -> Port {
+        Port(String::from("stderr"), 2, OpenMode::WriteOnly)
+    }
+
+    pub fn extra() -> Port {
+        Port(String::from("extra"), 3, OpenMode::ReadOnly)
     }
 }
 
@@ -166,9 +233,10 @@ fn do_child(mount_dir: &Path, binds: &[Bind], child_fd: RawFd) -> ! {
     init_sandbox(mount_dir, binds);
     let mut stream = unsafe { UnixStream::from_raw_fd(child_fd) };
     loop {
-        match bincode::deserialize_from(&mut stream).unwrap() {
-            Request::Execute(command) => bincode::serialize_into(
+        match bincode::deserialize_from(&mut stream) {
+            Ok(Request::Execute(command)) => bincode::serialize_into(
                 &mut stream, &do_execute(child_fd, command)).unwrap(),
+            Err(_) => process::exit(0),
         };
     }
 }
@@ -322,22 +390,25 @@ fn do_execute(socket_fd: RawFd, command: ExecuteCommand) -> ExecuteResult {
 mod tests {
     use super::*;
     use std::io::Read;
+    use std::thread;
 
     #[test]
     fn whoami() {
         let mut sandbox = Sandbox::new();
-        let stdout_path = sandbox.out_dir().join("stdout");
-        File::create(&stdout_path).unwrap();
+        let (pin, pout) = Pipe::new();
+        let data_thread = thread::spawn(move || {
+            let mut data = String::new();
+            pin.into_reader().read_to_string(&mut data).unwrap();
+            data
+        });
         let status = sandbox.execute(
             PathBuf::from("/usr/bin/whoami"),
             Box::new([String::from("whoami")]),
             default_envs(),
-            Box::new([OpenFile::new(PathBuf::from("/out/stdout"),
-                                    Box::new([1]), OpenMode::WriteOnly)]),
+            Box::new([(pout, Port::stdout())]),
             None).unwrap();
         assert_eq!(status, 0);
-        let mut data = String::new();
-        File::open(&stdout_path).unwrap().read_to_string(&mut data).unwrap();
+        let data = data_thread.join().unwrap();
         assert_eq!(data, "icebox\n");
         drop(sandbox);
     }
@@ -346,11 +417,10 @@ mod tests {
     fn read_only() {
         let mut sandbox = Sandbox::new();
         let status = sandbox.execute(
-            PathBuf::from("/usr/bin/touch"),
-            Box::new([String::from("touch"), String::from("/bin/dummy")]),
+            PathBuf::from("/usr/bin/test"),
+            Box::new([String::from("test"), String::from("-w"), String::from("/bin")]),
             default_envs(),
-            Box::new([OpenFile::new(PathBuf::from("/dev/null"),
-                                    Box::new([2]), OpenMode::WriteOnly)]),
+            Box::new([]),
             None).unwrap();
         assert_ne!(status, 0);
     }
