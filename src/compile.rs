@@ -61,12 +61,13 @@ pub fn run(user_target: Box<Package>, judge_target: Box<Package>, pool: &Pool<Sa
     judge_target.install(&judge_sandbox.in_dir());
     let (pin, pout) = Pipe::new();
     let user_thread = thread::spawn(move || {
-        user_sandbox.execute(
+        let user_result = user_sandbox.execute(
             PathBuf::from("/in/foo"),
             Box::new([String::from("foo")]),
             sandbox::default_envs(),
             Box::new([(pout, Port::stdout())]),
-            None)
+            None);
+        (user_result, user_sandbox)
     });
     let judge_result = judge_sandbox.execute(
         PathBuf::from("/in/foo"),
@@ -76,8 +77,8 @@ pub fn run(user_target: Box<Package>, judge_target: Box<Package>, pool: &Pool<Sa
         None);
     // TODO(iceboy): Cleanup sandbox.
     pool.put(judge_sandbox);
-    let user_result = user_thread.join().unwrap();
-    //pool.put(user_sandbox);
+    let (user_result, user_sandbox) = user_thread.join().unwrap();
+    pool.put(user_sandbox);
     // TODO(iceboy)
     println!("User return code: {}", user_result.unwrap());
     println!("Judge return code: {}", judge_result.unwrap());

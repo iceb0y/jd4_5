@@ -42,7 +42,10 @@ impl<R: Read + Seek> CaseVec<R> {
         let config = match canonical_names.get("config.ini") {
             Some(name) =>
                 parse_legacy_config(archive.by_name(name)?, &canonical_names)?,
-            None => panic!("not implemented"),
+            None => match canonical_names.get("config.yaml") {
+                Some(_) => panic!("not implemented"),
+                None => return Err(CaseError::FileNotFound),
+            },
         };
         Ok(CaseVec { archive, config })
     }

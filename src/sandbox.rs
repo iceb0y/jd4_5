@@ -37,7 +37,7 @@ pub struct PipeState {
     condvar: Condvar,
 }
 
-pub struct Port(String, RawFd, OpenMode);
+pub struct Port(String, RawFd, OFlag);
 
 #[derive(Serialize, Deserialize)]
 enum Request {
@@ -49,31 +49,16 @@ struct ExecuteCommand {
     file: PathBuf,
     args: Box<[String]>,
     envs: Box<[String]>,
-    open_files: Box<[OpenFile]>,
+    open_files: Box<[(PathBuf, RawFd, i32)]>,
     cgroup_file: Option<PathBuf>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct OpenFile {
-    file: PathBuf,
-    fds: Box<[RawFd]>,
-    mode: OpenMode,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-enum OpenMode {
-    ReadOnly,
-    WriteOnly,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
 struct Bind {
     source: PathBuf,
     target: PathBuf,
     mode: AccessMode,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
 enum AccessMode {
     ReadOnly,
     ReadWrite,
@@ -129,15 +114,11 @@ impl Sandbox {
         pipes: Box<[(Pipe, Port)]>,
         cgroup_file: Option<PathBuf>,
     ) -> ExecuteResult {
-        let open_files = pipes.into_vec().into_iter().map(|(pipe, port)| {
-            let Port(name, fd, mode) = port;
-            pipe.into_fifo(&self.in_dir().join(&name));
-            OpenFile {
-                file: PathBuf::from("/in").join(&name),
-                fds: Box::new([fd]),
-                mode,
-            }
-        }).collect::<Vec<_>>().into_boxed_slice();
+        let open_files = pipes.into_vec().into_iter().map(
+            |(pipe, Port(name, fd, oflag))| {
+                pipe.into_fifo(&self.in_dir().join(&name));
+                (PathBuf::from("/in").join(&name), fd, oflag.bits())
+            }).collect::<Vec<_>>().into_boxed_slice();
         bincode::serialize_into(&mut self.stream, &Request::Execute(
             ExecuteCommand { file, args, envs, open_files, cgroup_file }))
             .unwrap();
@@ -183,19 +164,19 @@ impl Pipe {
 
 impl Port {
     pub fn stdin() -> Port {
-        Port(String::from("stdin"), 0, OpenMode::ReadOnly)
+        Port(String::from("stdin"), 0, OFlag::O_RDONLY)
     }
 
     pub fn stdout() -> Port {
-        Port(String::from("stdout"), 1, OpenMode::WriteOnly)
+        Port(String::from("stdout"), 1, OFlag::O_WRONLY)
     }
 
     pub fn stderr() -> Port {
-        Port(String::from("stderr"), 2, OpenMode::WriteOnly)
+        Port(String::from("stderr"), 2, OFlag::O_WRONLY)
     }
 
     pub fn extra() -> Port {
-        Port(String::from("extra"), 3, OpenMode::ReadOnly)
+        Port(String::from("extra"), 3, OFlag::O_RDONLY)
     }
 }
 
@@ -358,18 +339,13 @@ fn do_execute(socket_fd: RawFd, command: ExecuteCommand) -> ExecuteResult {
         },
         unistd::ForkResult::Child => {
             unistd::close(socket_fd).unwrap();
-            for open_file in command.open_files.into_iter() {
-                let flag = match open_file.mode {
-                    OpenMode::ReadOnly => OFlag::O_RDONLY,
-                    OpenMode::WriteOnly => OFlag::O_WRONLY,
-                };
-                let source_fd = fcntl::open(
-                    &open_file.file, flag, stat::Mode::empty()).unwrap();
-                for &target_fd in open_file.fds.iter() {
-                    unistd::dup2(source_fd, target_fd).unwrap();
-                }
-                if open_file.fds.iter().any(|&fd| fd == source_fd) {
-                    unistd::close(source_fd).unwrap();
+            for &(ref path, ofd, oflag) in command.open_files.iter() {
+                let fd = fcntl::open(path,
+                                     OFlag::from_bits(oflag).unwrap(),
+                                     stat::Mode::empty()).unwrap();
+                if fd != ofd {
+                    unistd::dup2(fd, ofd).unwrap();
+                    unistd::close(fd).unwrap();
                 }
             }
             let file = CString::new(
