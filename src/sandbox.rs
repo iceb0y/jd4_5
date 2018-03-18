@@ -157,9 +157,13 @@ impl Pipe {
         File::open(maybe_path.as_ref().unwrap()).unwrap()
     }
 
-    /*pub fn into_writer(self) -> File {
-
-    }*/
+    pub fn into_writer(self) -> File {
+        let mut maybe_path = self.0.path.lock().unwrap();
+        while maybe_path.is_none() {
+            maybe_path = self.0.condvar.wait(maybe_path).unwrap();
+        }
+        File::create(maybe_path.as_ref().unwrap()).unwrap()
+    }
 }
 
 impl Port {

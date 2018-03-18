@@ -5,10 +5,16 @@ authors = ["iceboy"]
 
 [dependencies]
 bincode = "1.0.0"
+lazy_static = "1.0.0"
 nix = "0.10.0"
 rand = "0.4.2"
 serde = "1.0.33"
 serde_derive = "1.0.33"
 serde_yaml = "0.7.3"
+shlex = "0.1.1"
 tempdir = "0.3.6"
 zip = "0.3.1"
+
+[dependencies.linear-map]
+version = "1.2.0"
+features = ["serde_impl"]

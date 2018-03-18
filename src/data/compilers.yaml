@@ -1,0 +1,82 @@
+# TODO(iceboy): Use static linkage for supported compilers.
+c:
+    type: compiler
+    compiler_file: /usr/bin/gcc
+    compiler_args: gcc -O2 -Wall -std=c99 -o /out/foo /in/foo.c -lm
+    code_file: foo.c
+    execute_file: foo
+    execute_args: foo
+cc:
+    type: compiler
+    compiler_file: /usr/bin/g++
+    compiler_args: g++ -O2 -Wall -std=c++11 -o /out/foo /in/foo.cc -lm
+    code_file: foo.cc
+    execute_file: foo
+    execute_args: foo
+pas:
+    type: compiler
+    compiler_file: /usr/bin/fpc
+    compiler_args: fpc -O2 -o/out/foo /in/foo.pas
+    code_file: foo.pas
+    execute_file: foo
+    execute_args: foo
+java:
+    type: compiler
+    compiler_file: /usr/bin/javac
+    compiler_args: javac -d /out -encoding utf8 /in/Main.java
+    code_file: Main.java
+    execute_file: /usr/bin/java
+    execute_args: java Main
+py:
+    type: interpreter
+    code_file: foo.py
+    execute_file: /usr/bin/python
+    execute_args: python foo.py
+py3:
+    type: interpreter
+    code_file: foo.py
+    execute_file: /usr/bin/python3
+    execute_args: python3 foo.py
+php:
+    type: interpreter
+    code_file: foo.php
+    execute_file: /usr/bin/php
+    execute_args: php foo.php
+rs:
+    type: compiler
+    compiler_file: /usr/bin/rustc
+    compiler_args: rustc -O -o /out/foo /in/foo.rs
+    code_file: foo.rs
+    execute_file: foo
+    execute_args: foo
+hs:
+    type: compiler
+    compiler_file: /usr/bin/ghc
+    compiler_args: ghc -O -outputdir /tmp -o /out/foo /in/foo.hs
+    code_file: foo.hs
+    execute_file: foo
+    execute_args: foo
+js:
+    type: interpreter
+    code_file: foo.js
+    execute_file: /usr/bin/jsc
+    execute_args: jsc foo.js
+go:
+    type: compiler
+    compiler_file: /usr/bin/go
+    compiler_args: go build -o /out/foo /in/foo.go
+    code_file: foo.go
+    execute_file: foo
+    execute_args: foo
+rb:
+    type: interpreter
+    code_file: foo.rb
+    execute_file: /usr/bin/ruby
+    execute_args: ruby foo.rb
+cs:
+    type: compiler
+    compiler_file: /usr/bin/mcs
+    compiler_args: csc -optimize+ -out:/out/foo.exe /in/foo.cs
+    code_file: foo.cs
+    execute_file: /usr/bin/mono
+    execute_args: mono foo.exe

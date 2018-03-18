@@ -1,5 +1,5 @@
 use std::fs::{File, Permissions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::thread;
@@ -7,33 +7,60 @@ use package::{Package, SingleFilePackage};
 use sandbox::{self, Pipe, Port, Sandbox};
 use util::Pool;
 
-pub trait Compiler {
-    fn package(&self, source: Box<[u8]>) -> Box<Package>;
-    fn compile(&self, source: Box<Package>, pool: &Pool<Sandbox>) -> Box<Package>;
+pub trait Compiler : Sync {
+    fn compile(&self, source: &[u8], pool: &Pool<Sandbox>) -> Box<Package>;
 }
 
-#[derive(Serialize, Deserialize)]
 pub struct BinaryCompiler {
     compiler_file: PathBuf,
     compiler_args: Box<[String]>,
     code_file: PathBuf,
-    execute_file: PathBuf,
-    execute_args: Box<[String]>,
+    target_file: PathBuf,
+    target_args: Box<[String]>,
+}
+
+pub struct Interpreter {
+    code_file: PathBuf,
+    target_file: PathBuf,
+    target_args: Box<[String]>,
+}
+
+impl BinaryCompiler {
+    pub fn new(
+        compiler_file: PathBuf,
+        compiler_args: Box<[String]>,
+        code_file: PathBuf,
+        target_file: PathBuf,
+        target_args: Box<[String]>,
+    ) -> BinaryCompiler {
+        BinaryCompiler {
+            compiler_file,
+            compiler_args,
+            code_file,
+            target_file,
+            target_args,
+        }
+    }
+}
+
+impl Interpreter {
+    pub fn new(
+        code_file: PathBuf,
+        target_file: PathBuf,
+        target_args: Box<[String]>,
+    ) -> Interpreter {
+        Interpreter { code_file, target_file, target_args }
+    }
 }
 
 impl Compiler for BinaryCompiler {
-    fn package(&self, source: Box<[u8]>) -> Box<Package> {
-        let package = SingleFilePackage::new(
-            self.code_file.clone(), source, Permissions::from_mode(0o600));
-        Box::new(package)
-    }
-
-    fn compile(&self, source: Box<Package>, pool: &Pool<Sandbox>) -> Box<Package> {
+    fn compile(&self, source: &[u8], pool: &Pool<Sandbox>) -> Box<Package> {
         let compiler_file = self.compiler_file.clone();
         let compiler_args = self.compiler_args.clone();
-        let target_file = self.execute_file.clone();
         let mut sandbox = pool.get_one();
-        source.install(&sandbox.in_dir());
+        let mut file = File::create(
+            sandbox.in_dir().join(&self.code_file)).unwrap();
+        file.write_all(&source).unwrap();
         // TODO(iceboy): stdin, stdout, stderr, cgroup
         let status = sandbox.execute(
             compiler_file,
@@ -43,14 +70,24 @@ impl Compiler for BinaryCompiler {
             None).unwrap();
         assert_eq!(status, 0);
         let mut foo =
-            File::open(sandbox.out_dir().join(&target_file)).unwrap();
+            File::open(sandbox.out_dir().join(&self.target_file)).unwrap();
         let mut data = Vec::new();
         foo.read_to_end(&mut data).unwrap();
         let package = SingleFilePackage::new(
-            target_file, data.into_boxed_slice(),
+            self.target_file.clone(), data.into_boxed_slice(),
             foo.metadata().unwrap().permissions());
+        // TODO(iceboy): Cleanup sandbox.
         pool.put(sandbox);
         Box::new(package)
+    }
+}
+
+impl Compiler for Interpreter {
+    fn compile(&self, source: &[u8], _: &Pool<Sandbox>) -> Box<Package> {
+        Box::new(SingleFilePackage::new(
+            self.code_file.clone(),
+            source.to_vec().into_boxed_slice(),
+            Permissions::from_mode(0o600)))
     }
 }
 
