@@ -13,5 +13,6 @@ fn main() {
         PathBuf::from("/"),
         Box::new([]),
         None).unwrap();
+    drop(sandbox);
     process::exit(status);
 }
