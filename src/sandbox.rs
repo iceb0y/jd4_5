@@ -49,6 +49,7 @@ struct ExecuteCommand {
     file: PathBuf,
     args: Box<[String]>,
     envs: Box<[String]>,
+    working_dir: PathBuf,
     open_files: Box<[(PathBuf, RawFd, i32)]>,
     cgroup_file: Option<PathBuf>,
 }
@@ -76,7 +77,7 @@ impl Sandbox {
             socket::SockType::Stream,
             None,
             socket::SockFlag::empty()).unwrap();
-        let sandbox_dir = TempDir::new("sandbox").unwrap();
+        let sandbox_dir = TempDir::new("jd-sandbox").unwrap();
         let in_dir = sandbox_dir.path().join("in");
         fs::create_dir(&in_dir).unwrap();
         let out_dir = sandbox_dir.path().join("out");
@@ -111,6 +112,7 @@ impl Sandbox {
         file: PathBuf,
         args: Box<[String]>,
         envs: Box<[String]>,
+        working_dir: PathBuf,
         pipes: Box<[(Pipe, Port)]>,
         cgroup_file: Option<PathBuf>,
     ) -> ExecuteResult {
@@ -119,9 +121,9 @@ impl Sandbox {
                 pipe.into_fifo(&self.in_dir().join(&name));
                 (PathBuf::from("/in").join(&name), fd, oflag.bits())
             }).collect::<Vec<_>>().into_boxed_slice();
-        bincode::serialize_into(&mut self.stream, &Request::Execute(
-            ExecuteCommand { file, args, envs, open_files, cgroup_file }))
-            .unwrap();
+        let request = Request::Execute(ExecuteCommand {
+            file, args, envs, working_dir, open_files, cgroup_file });
+        bincode::serialize_into(&mut self.stream, &request).unwrap();
         bincode::deserialize_from(&mut self.stream).unwrap()
     }
 }
@@ -343,6 +345,7 @@ fn do_execute(socket_fd: RawFd, command: ExecuteCommand) -> ExecuteResult {
         },
         unistd::ForkResult::Child => {
             unistd::close(socket_fd).unwrap();
+            env::set_current_dir(&command.working_dir).unwrap();
             for &(ref path, ofd, oflag) in command.open_files.iter() {
                 let fd = fcntl::open(path,
                                      OFlag::from_bits(oflag).unwrap(),
@@ -385,6 +388,7 @@ mod tests {
             PathBuf::from("/usr/bin/whoami"),
             Box::new([String::from("whoami")]),
             default_envs(),
+            PathBuf::from("/"),
             Box::new([(pout, Port::stdout())]),
             None).unwrap();
         assert_eq!(status, 0);
@@ -400,6 +404,7 @@ mod tests {
             PathBuf::from("/usr/bin/test"),
             Box::new([String::from("test"), String::from("-w"), String::from("/bin")]),
             default_envs(),
+            PathBuf::from("/"),
             Box::new([]),
             None).unwrap();
         assert_ne!(status, 0);

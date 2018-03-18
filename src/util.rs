@@ -1,3 +1,5 @@
+use std::fs;
+use std::path::Path;
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
 
@@ -24,6 +26,20 @@ impl<T> Pool<T> {
     pub fn get_two(&self) -> (T, T) {
         let rx = self.rx.lock().unwrap();
         (rx.recv().unwrap(), rx.recv().unwrap())
+    }
+}
+
+pub fn copy_dir(from: &Path, to: &Path) {
+    for result in fs::read_dir(from).unwrap() {
+        let entry = result.unwrap();
+        let file_type = entry.file_type().unwrap();
+        let inner_from = entry.path();
+        let inner_to = to.join(&entry.file_name());
+        if file_type.is_dir() {
+            copy_dir(&inner_from, &inner_to);
+        } else {
+            fs::copy(&inner_from, &inner_to).unwrap();
+        }
     }
 }
 

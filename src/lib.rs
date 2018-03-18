@@ -16,6 +16,5 @@ pub mod case;
 pub mod cgroup;
 pub mod compile;
 pub mod config;
-pub mod package;
 pub mod sandbox;
 pub mod util;

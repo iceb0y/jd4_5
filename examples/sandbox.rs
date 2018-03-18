@@ -10,6 +10,7 @@ fn main() {
         PathBuf::from("/bin/bash"),
         Box::new([String::from("bunny")]),
         sandbox::default_envs(),
+        PathBuf::from("/"),
         Box::new([]),
         None).unwrap();
     process::exit(status);
