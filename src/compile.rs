@@ -67,7 +67,7 @@ impl Compiler for BinaryCompiler {
         assert_eq!(status, 0);
         let package_dir = TempDir::new("jd-package").unwrap();
         util::copy_dir(&sandbox.out_dir(), package_dir.path());
-        // TODO(iceboy): Cleanup sandbox.
+        sandbox.cleanup();
         pool.put(sandbox);
         Target {
             package_dir,
@@ -139,9 +139,10 @@ pub fn run(user_target: Target, judge_target: Target, pool: &Pool<Sandbox>) {
         sandbox::default_envs(),
         Box::new([(pin, Port::extra())]),
         None);
-    // TODO(iceboy): Cleanup sandbox.
+    judge_sandbox.cleanup();
     pool.put(judge_sandbox);
-    let (user_result, user_sandbox) = user_thread.join().unwrap();
+    let (user_result, mut user_sandbox) = user_thread.join().unwrap();
+    user_sandbox.cleanup();
     pool.put(user_sandbox);
     // TODO(iceboy)
     println!("User return code: {}", user_result.unwrap());

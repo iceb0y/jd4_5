@@ -43,6 +43,20 @@ pub fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
+pub fn clean_dir(path: &Path) {
+    for result in fs::read_dir(path).unwrap() {
+        let entry = result.unwrap();
+        let file_type = entry.file_type().unwrap();
+        let inner_path = entry.path();
+        if file_type.is_dir() {
+            clean_dir(&inner_path);
+            fs::remove_dir(&inner_path).unwrap();
+        } else {
+            fs::remove_file(&inner_path).unwrap();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

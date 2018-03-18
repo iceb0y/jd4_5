@@ -17,6 +17,7 @@ use nix::sys::stat::{self, Mode, SFlag};
 use nix::sys::wait::{self, WaitStatus};
 use nix::unistd::{self, Uid, Gid};
 use tempdir::TempDir;
+use util;
 
 pub struct Sandbox {
     stream: UnixStream,
@@ -42,6 +43,7 @@ pub struct Port(String, RawFd, OFlag);
 #[derive(Serialize, Deserialize)]
 enum Request {
     Execute(ExecuteCommand),
+    Cleanup,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -124,6 +126,13 @@ impl Sandbox {
         let request = Request::Execute(ExecuteCommand {
             file, args, envs, working_dir, open_files, cgroup_file });
         bincode::serialize_into(&mut self.stream, &request).unwrap();
+        bincode::deserialize_from(&mut self.stream).unwrap()
+    }
+
+    pub fn cleanup(&mut self) {
+        bincode::serialize_into(&mut self.stream, &Request::Cleanup).unwrap();
+        util::clean_dir(&self.in_dir());
+        util::clean_dir(&self.out_dir());
         bincode::deserialize_from(&mut self.stream).unwrap()
     }
 }
@@ -223,6 +232,8 @@ fn do_child(mount_dir: &Path, binds: &[Bind], child_fd: RawFd) -> ! {
         match bincode::deserialize_from(&mut stream) {
             Ok(Request::Execute(command)) => bincode::serialize_into(
                 &mut stream, &do_execute(child_fd, command)).unwrap(),
+            Ok(Request::Cleanup) => bincode::serialize_into(
+                &mut stream, &do_cleanup()).unwrap(),
             Err(_) => process::exit(0),
         };
     }
@@ -367,6 +378,10 @@ fn do_execute(socket_fd: RawFd, command: ExecuteCommand) -> ExecuteResult {
             panic!();
         },
     }
+}
+
+fn do_cleanup() {
+    util::clean_dir(Path::new("/tmp"));
 }
 
 #[cfg(test)]
